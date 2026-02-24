@@ -19,6 +19,7 @@ import time
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+from torch.amp import GradScaler, autocast
 
 from model import MTT
 
@@ -31,10 +32,11 @@ CFG = dict(
     languages            = ["de", "fr", "vi", "es"],   # paired with "en" + each other
     max_samples_per_pair = 50_000,
 
-    train_steps          = 800,    # train steps per cycle
+    train_steps          = 800,    # train steps per cycle (counted after accumulation)
     test_steps           = 200,    # test  steps per cycle (runs right after train)
 
-    batch_size           = 8,
+    batch_size           = 1,      # micro-batch per forward pass (reduced for 6GB)
+    accum_steps          = 4,      # gradient accumulation → effective batch = 2×4 = 8
     lr                   = 5e-5,
     grad_clip            = 1.0,
 
@@ -47,7 +49,7 @@ CFG = dict(
     checkpoint_minutes   = 30.0,
 
     device               = "cuda" if torch.cuda.is_available() else "cpu",
-    num_workers          = max(4, os.cpu_count() or 1),
+    num_workers          = 2,      # lower = less shared memory pressure
 )
 
 
@@ -61,8 +63,7 @@ def _fetch_pair(src: str, tgt: str, split: str, max_n: int) -> list:
 
     for key in [f"{src}-{tgt}", f"{tgt}-{src}"]:
         try:
-            ds  = load_dataset("Helsinki-NLP/opus-100", key,
-                               split=split, trust_remote_code=True)
+            ds  = load_dataset("Helsinki-NLP/opus-100", key, split=split)
             out = []
             for row in ds:
                 t = row["translation"]
@@ -88,7 +89,6 @@ def fetch_all_pairs() -> tuple:
     max_n     = CFG["max_samples_per_pair"]
     all_langs = CFG["languages"] + ["en"]
 
-    # Every unique pair (order doesn't matter for the set, but we fetch both directions)
     unique_pairs = [(all_langs[i], all_langs[j])
                     for i in range(len(all_langs))
                     for j in range(i + 1, len(all_langs))]
@@ -103,7 +103,6 @@ def fetch_all_pairs() -> tuple:
             train_all += rows
             test_all  += tst
         elif src != "en" and tgt != "en":
-            # Pivot: src→en + en→tgt  →  src→tgt
             print(f"  [DATA]  Pivoting {src}→{tgt} through English...")
             en_src    = _fetch_pair("en", src, "train", max_n // 2)
             en_tgt    = _fetch_pair("en", tgt, "train", max_n // 2)
@@ -158,20 +157,21 @@ def infinite_loader(loader: DataLoader):
 # CHECKPOINT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def save_checkpoint(model, optimizer, scheduler, global_step: int, cycle: int):
+def save_checkpoint(model, optimizer, scheduler, scaler, global_step: int, cycle: int):
     torch.save({
         "global_step": global_step,
         "cycle":       cycle,
         "model":       model.state_dict(),
         "optimizer":   optimizer.state_dict(),
         "scheduler":   scheduler.state_dict(),
+        "scaler":      scaler.state_dict(),
         "lr":          optimizer.param_groups[0]["lr"],
     }, CFG["checkpoint_path"])
     print(f"  [CKPT]  Saved → {CFG['checkpoint_path']}  "
           f"(global step {global_step}, cycle {cycle})")
 
 
-def load_checkpoint(model, optimizer, scheduler, device: str) -> tuple:
+def load_checkpoint(model, optimizer, scheduler, scaler, device: str) -> tuple:
     path = CFG["checkpoint_path"]
     if not os.path.exists(path):
         return 0, 0
@@ -179,6 +179,8 @@ def load_checkpoint(model, optimizer, scheduler, device: str) -> tuple:
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
+    if "scaler" in ckpt:
+        scaler.load_state_dict(ckpt["scaler"])
     for pg in optimizer.param_groups:
         pg["lr"] = ckpt["lr"]
     print(f"  [CKPT]  Resumed — global step {ckpt['global_step']}  "
@@ -194,10 +196,19 @@ def train(model: MTT,
           train_dataset: TranslationDataset,
           test_dataset: TranslationDataset):
 
-    device   = CFG["device"]
-    ckpt_sec = CFG["checkpoint_minutes"] * 60
+    device      = CFG["device"]
+    ckpt_sec    = CFG["checkpoint_minutes"] * 60
+    accum_steps = CFG["accum_steps"]
+    use_amp     = (device == "cuda")
 
     model.to(device)
+
+    # Gradient checkpointing: recompute activations during backward
+    # instead of storing them → saves ~30-40% VRAM at cost of ~20% speed
+    if hasattr(model.encoder, "gradient_checkpointing_enable"):
+        model.encoder.gradient_checkpointing_enable()
+    if hasattr(model.decoder, "gradient_checkpointing_enable"):
+        model.decoder.gradient_checkpointing_enable()
 
     optimizer = optim.AdamW(model.parameters(),
                             lr=CFG["lr"], weight_decay=1e-2)
@@ -210,7 +221,10 @@ def train(model: MTT,
         min_lr   = CFG["lr_min"],
     )
 
-    global_step, cycle = load_checkpoint(model, optimizer, scheduler, device)
+    # Mixed precision scaler — fp16 cuts VRAM ~50% for activations/gradients
+    scaler = GradScaler(device, enabled=use_amp)
+
+    global_step, cycle = load_checkpoint(model, optimizer, scheduler, scaler, device)
 
     use_pin = (device == "cuda")
     loader_kwargs = dict(
@@ -233,10 +247,13 @@ def train(model: MTT,
     signal.signal(signal.SIGINT, _on_stop)
 
     last_ckpt = time.time()
+    eff_batch = CFG["batch_size"] * accum_steps
 
     print(f"\n{'═'*64}")
     print(f"  MTT Training  |  device={device}  |  lr={CFG['lr']:.2e}")
-    print(f"  Cycle  =  800 train steps  +  200 test steps")
+    print(f"  micro-batch={CFG['batch_size']}  accum={accum_steps}  effective batch={eff_batch}")
+    print(f"  Mixed precision fp16: {use_amp}  |  Gradient checkpointing: ON")
+    print(f"  Cycle  =  {CFG['train_steps']} train steps + {CFG['test_steps']} test steps")
     print(f"  LR auto-adjusted via ReduceLROnPlateau after every cycle")
     print(f"  Checkpoint every {CFG['checkpoint_minutes']} min + end of each cycle")
     print(f"  Press Ctrl+C to stop safely at any time")
@@ -255,53 +272,65 @@ def train(model: MTT,
         # ══════════════════════════════════════════════════════════════════════
         model.train()
         train_loss_sum = 0.0
+        accum_loss     = 0.0
+        train_step     = 0
 
-        for train_step in range(1, CFG["train_steps"] + 1):
+        optimizer.zero_grad(set_to_none=True)
+
+        for micro_step in range(1, CFG["train_steps"] * accum_steps + 1):
             if stop:
                 break
 
             srcs, tgts, langs, ners = next(train_iter)
 
-            optimizer.zero_grad(set_to_none=True)   # faster than zero_grad()
+            with autocast(device, enabled=use_amp):
+                out  = model(
+                    srcText    = srcs,
+                    targetLang = langs[0],
+                    targetText = tgts,
+                    nerTags    = ners,
+                    returnLoss = True,
+                    device     = device,
+                )
+                loss = out["loss"] / accum_steps  # normalize for accumulation
 
-            out = model(
-                srcText    = srcs,
-                targetLang = langs[0],
-                targetText = tgts,
-                nerTags    = ners,
-                returnLoss = True,
-                device     = device,
-            )
+            scaler.scale(loss).backward()
+            accum_loss += loss.item()
 
-            loss = out["loss"]
+            # Optimizer step every accum_steps micro-batches
+            if micro_step % accum_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CFG["grad_clip"])
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
-            # ── Backpropagation + gradient descent ────────────────────────────
-            loss.backward()                                          # compute all gradients
-            torch.nn.utils.clip_grad_norm_(model.parameters(),      # clip to prevent explosion
-                                           CFG["grad_clip"])
-            optimizer.step()                                         # update every weight
-            # ──────────────────────────────────────────────────────────────────
+                global_step    += 1
+                train_step     += 1
+                train_loss_sum += accum_loss
 
-            global_step    += 1
-            train_loss_sum += loss.item()
+                trans = out["translationLoss"]
+                ner   = out["nerLoss"]
+                print(
+                    f"  [TRAIN]"
+                    f"  global={global_step:>7}"
+                    f"  cycle={cycle}  step={train_step:>3}/{CFG['train_steps']}"
+                    f"  lang={langs[0]}"
+                    f"  loss={accum_loss:.4f}"
+                    + (f"  trans={trans.item()/accum_steps:.4f}" if trans is not None else "")
+                    + (f"  ner={ner.item()/accum_steps:.4f}"     if ner   is not None else "")
+                    + f"  lr={optimizer.param_groups[0]['lr']:.2e}"
+                )
+                accum_loss = 0.0
 
-            trans = out["translationLoss"]
-            ner   = out["nerLoss"]
-            print(
-                f"  [TRAIN]"
-                f"  global={global_step:>7}"
-                f"  cycle={cycle}  train_step={train_step:>3}/{CFG['train_steps']}"
-                f"  lang={langs[0]}"
-                f"  loss={loss.item():.4f}"
-                + (f"  trans={trans.item():.4f}" if trans is not None else "")
-                + (f"  ner={ner.item():.4f}"     if ner   is not None else "")
-                + f"  lr={optimizer.param_groups[0]['lr']:.2e}"
-            )
+                # Timed checkpoint
+                if time.time() - last_ckpt >= ckpt_sec:
+                    save_checkpoint(model, optimizer, scheduler, scaler, global_step, cycle)
+                    last_ckpt = time.time()
 
-            # Timed checkpoint (every 30 min, mid-cycle)
-            if time.time() - last_ckpt >= ckpt_sec:
-                save_checkpoint(model, optimizer, scheduler, global_step, cycle)
-                last_ckpt = time.time()
+                # Periodically free VRAM cache
+                if global_step % 50 == 0:
+                    torch.cuda.empty_cache()
 
         avg_train = train_loss_sum / max(train_step, 1)
         print(f"\n  [CYCLE {cycle}]  ── Train done ──  avg loss: {avg_train:.4f}\n")
@@ -322,14 +351,15 @@ def train(model: MTT,
                 if test_step > CFG["test_steps"]:
                     break
 
-                out = model(
-                    srcText    = srcs,
-                    targetLang = langs[0],
-                    targetText = tgts,
-                    nerTags    = ners,
-                    returnLoss = True,
-                    device     = device,
-                )
+                with autocast(device, enabled=use_amp):
+                    out = model(
+                        srcText    = srcs,
+                        targetLang = langs[0],
+                        targetText = tgts,
+                        nerTags    = ners,
+                        returnLoss = True,
+                        device     = device,
+                    )
 
                 lv = out["loss"].item()
                 test_loss_sum += lv
@@ -346,6 +376,8 @@ def train(model: MTT,
                     f"  loss={lv:.4f}"
                 )
 
+        torch.cuda.empty_cache()
+
         n         = CFG["test_steps"]
         avg_test  = test_loss_sum  / n
         avg_trans = test_trans_sum / n
@@ -358,7 +390,7 @@ def train(model: MTT,
         # PHASE 3 — AUTO ADJUST LR
         # ══════════════════════════════════════════════════════════════════════
         prev_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step(avg_test)                    # reduce if no improvement
+        scheduler.step(avg_test)
         new_lr  = optimizer.param_groups[0]["lr"]
 
         if new_lr < prev_lr:
@@ -366,13 +398,12 @@ def train(model: MTT,
         else:
             print(f"  [LR  ]  Holding  {new_lr:.2e}  (still improving)")
 
-        # End-of-cycle checkpoint
         print()
-        save_checkpoint(model, optimizer, scheduler, global_step, cycle)
+        save_checkpoint(model, optimizer, scheduler, scaler, global_step, cycle)
         last_ckpt = time.time()
 
     # ── Final save on Ctrl+C ──────────────────────────────────────────────────
-    save_checkpoint(model, optimizer, scheduler, global_step, cycle)
+    save_checkpoint(model, optimizer, scheduler, scaler, global_step, cycle)
     print(f"\n  Stopped at global step {global_step}, cycle {cycle}. Goodbye!")
 
 
@@ -381,6 +412,9 @@ def train(model: MTT,
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    # Reduce VRAM fragmentation
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     print("  Fetching data from HuggingFace OPUS-100...\n")
     train_samples, test_samples = fetch_all_pairs()
 
