@@ -41,6 +41,7 @@ class MTT(nn.Module):
         mt5.resize_token_embeddings(len(self.tokenizer))
         self.decoder = mt5.decoder
         self.lmHead = mt5.lm_head
+        self.decoderStartTokenId = mt5.config.decoder_start_token_id or mt5.config.pad_token_id
         del mt5
 
         #projector
@@ -68,7 +69,16 @@ class MTT(nn.Module):
 
         print("Total: ", encoderPara + embedPara + nerPara + proPara + decoderPara + lmPara)
 
-    def forward(self, srcText, targetLang, targetText = None, nerTags = None, returnLoss = True, device = "cpu"):
+    def _shiftRight(self, inputIds: torch.Tensor) -> torch.Tensor:
+        """Shift input ids one position right, prepend decoder_start_token_id (teacher forcing)."""
+        shifted = inputIds.new_zeros(inputIds.shape)
+        shifted[:, 1:] = inputIds[:, :-1].clone()
+        shifted[:, 0]  = self.decoderStartTokenId
+        # replace -100 (padding label) with pad_token_id so decoder doesn't choke
+        shifted[shifted == -100] = self.tokenizer.pad_token_id
+        return shifted
+
+    def forward(self, srcText, targetLang, targetText=None, nerTags=None, returnLoss=True, device="cpu"):
         taggedSrc = [f"<2{targetLang}> {text}" for text in srcText]
         srcEncoded = self.tokenizer(
             taggedSrc,
@@ -78,6 +88,7 @@ class MTT(nn.Module):
             max_length = 128
         ).to(device)
         labels = None
+        decoderInputIds = None
     
         if targetText is not None:
             targetEncoded = self.tokenizer(
@@ -90,6 +101,9 @@ class MTT(nn.Module):
             
             labels = targetEncoded.input_ids.clone()
             labels[labels == self.tokenizer.pad_token_id] = -100
+
+            # Teacher forcing: decoder sees ground-truth shifted right
+            decoderInputIds = self._shiftRight(labels)
 
         encoderOut = self.encoder(
             input_ids = srcEncoded.input_ids,
@@ -107,16 +121,28 @@ class MTT(nn.Module):
                 ignore_index = -100
             )
 
-        tagIndices = nerTags if nerTags is not None else nerLogits.argmax(dim = -1)
+        tagIndices = nerTags if nerTags is not None else nerLogits.argmax(dim=-1)
+        # nerTags may contain -100 (padding), clamp to valid range before embedding
+        tagIndices = tagIndices.clamp(min=0)
         nerEmbeds = self.nerEmbed(tagIndices)
         nerOut = encoderOut + nerEmbeds
 
         projected = self.projector(nerOut)
 
+        # If no target provided (inference path), use a single BOS token as decoder seed
+        if decoderInputIds is None:
+            decoderInputIds = torch.full(
+                (projected.size(0), 1),
+                self.decoderStartTokenId,
+                dtype=torch.long,
+                device=device
+            )
+
         decoderOut = self.decoder(
+            input_ids              = decoderInputIds,
+            encoder_hidden_states  = projected,
             encoder_attention_mask = srcEncoded.attention_mask,
-            encoder_hidden_states = projected,
-            return_dict = True
+            return_dict            = True
         )
 
         logits = self.lmHead(decoderOut.last_hidden_state)
@@ -183,7 +209,7 @@ class MTT(nn.Module):
 
         # --- Autoregressive decoding with beam search ---
             batchSize   = projected.size(0)
-            bosTokenId  = self.tokenizer.bos_token_id or self.tokenizer.pad_token_id
+            bosTokenId  = self.decoderStartTokenId
             eosTokenId  = self.tokenizer.eos_token_id
             padTokenId  = self.tokenizer.pad_token_id
 
