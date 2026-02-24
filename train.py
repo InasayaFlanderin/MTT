@@ -51,6 +51,7 @@ CFG = dict(
 
     device               = "cuda" if torch.cuda.is_available() else "cpu",
     num_workers          = max(0, (os.cpu_count() or 1) - 1),
+
 )
 
 

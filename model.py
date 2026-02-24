@@ -59,6 +59,54 @@ class MTT(nn.Module):
         for param in self.lmHead.parameters():
             param.requires_grad = True
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # LOAD CHECKPOINT
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @classmethod
+    def load(cls, checkpoint_path: str, device: str = "cpu") -> "MTT":
+        """
+        Tạo model mới rồi load weights từ file checkpoint của train.py.
+
+        Ví dụ:
+            model = MTT.load("mtt_checkpoint.pt", device="cpu")
+            model.eval()
+
+        Args:
+            checkpoint_path : đường dẫn tới file .pt do train.py lưu
+            device          : "cpu" hoặc "cuda"
+
+        Returns:
+            MTT instance đã load weights, ở chế độ eval
+        """
+        if not torch.cuda.is_available() and device == "cuda":
+            print("[LOAD] CUDA không khả dụng, chuyển sang CPU.")
+            device = "cpu"
+
+        print(f"[LOAD] Đang khởi tạo model...")
+        model = cls()
+
+        print(f"[LOAD] Đang load checkpoint: {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location=device)
+
+        # Checkpoint từ train.py lưu key "model" chứa state_dict
+        if "model" in ckpt:
+            state_dict = ckpt["model"]
+            print(f"[LOAD] Global step : {ckpt.get('global_step', '?')}")
+            print(f"[LOAD] Cycle        : {ckpt.get('cycle', '?')}")
+            print(f"[LOAD] LR cuối      : {ckpt.get('lr', '?')}")
+        else:
+            # Nếu file là raw state_dict (lưu thẳng không qua train.py)
+            state_dict = ckpt
+
+        model.load_state_dict(state_dict)
+        model.to(device)
+        model.eval()
+        print(f"[LOAD] Load thành công! Model sẵn sàng trên {device}.\n")
+        return model
+
+    # ══════════════════════════════════════════════════════════════════════════
+
     def paramsCalc(self):
         encoderPara = sum(p.numel() for p in self.encoder.parameters())
         embedPara = sum(p.numel() for p in self.nerEmbed.parameters())
@@ -74,7 +122,6 @@ class MTT(nn.Module):
         shifted = inputIds.new_zeros(inputIds.shape)
         shifted[:, 1:] = inputIds[:, :-1].clone()
         shifted[:, 0]  = self.decoderStartTokenId
-        # replace -100 (padding label) with pad_token_id so decoder doesn't choke
         shifted[shifted == -100] = self.tokenizer.pad_token_id
         return shifted
 
@@ -102,7 +149,6 @@ class MTT(nn.Module):
             labels = targetEncoded.input_ids.clone()
             labels[labels == self.tokenizer.pad_token_id] = -100
 
-            # Teacher forcing: decoder sees ground-truth shifted right
             decoderInputIds = self._shiftRight(labels)
 
         encoderOut = self.encoder(
@@ -122,14 +168,12 @@ class MTT(nn.Module):
             )
 
         tagIndices = nerTags if nerTags is not None else nerLogits.argmax(dim=-1)
-        # nerTags may contain -100 (padding), clamp to valid range before embedding
         tagIndices = tagIndices.clamp(min=0)
         nerEmbeds = self.nerEmbed(tagIndices)
         nerOut = encoderOut + nerEmbeds
 
         projected = self.projector(nerOut)
 
-        # If no target provided (inference path), use a single BOS token as decoder seed
         if decoderInputIds is None:
             decoderInputIds = torch.full(
                 (projected.size(0), 1),
@@ -158,7 +202,6 @@ class MTT(nn.Module):
         totalLoss = None
         if returnLoss and translationLoss is not None:
             totalLoss = translationLoss
-
             if nerLoss is not None:
                 totalLoss = translationLoss + 0.2 * nerLoss
 
@@ -184,7 +227,6 @@ class MTT(nn.Module):
 
         self.eval()
         with torch.no_grad():
-            # --- Encode source ---
             taggedSrc = [f"<2{targetLang}> {text}" for text in srcText]
             srcEncoded = self.tokenizer(
                 taggedSrc,
@@ -197,23 +239,20 @@ class MTT(nn.Module):
             encoderOut = self.encoder(
                 input_ids=srcEncoded.input_ids,
                 attention_mask=srcEncoded.attention_mask
-            ).last_hidden_state                                 # (B, S, encoder_hidden)
+            ).last_hidden_state
 
-        # --- NER embedding (predicted tags, no ground truth at inference) ---
             nerLogits = self.nerClassifier(encoderOut)
-            predTags  = nerLogits.argmax(dim=-1)               # (B, S)
-            nerEmbeds = self.nerEmbed(predTags)                 # (B, S, encoder_hidden)
+            predTags  = nerLogits.argmax(dim=-1)
+            nerEmbeds = self.nerEmbed(predTags)
             nerOut    = encoderOut + nerEmbeds
 
-            projected = self.projector(nerOut)                 # (B, S, decoder_hidden)
+            projected = self.projector(nerOut)
 
-        # --- Autoregressive decoding with beam search ---
             batchSize   = projected.size(0)
             bosTokenId  = self.decoderStartTokenId
             eosTokenId  = self.tokenizer.eos_token_id
             padTokenId  = self.tokenizer.pad_token_id
 
-        # Expand encoder outputs for beam search: (B*numBeams, S, H)
             expanded = projected.unsqueeze(1) \
                             .expand(-1, numBeams, -1, -1) \
                             .reshape(batchSize * numBeams, projected.size(1), projected.size(2))
@@ -223,12 +262,10 @@ class MTT(nn.Module):
                                  .expand(-1, numBeams, -1) \
                                  .reshape(batchSize * numBeams, -1)
 
-        # Initialise beam hypotheses
             beamScores  = torch.zeros(batchSize, numBeams, device=device)
-            beamScores[:, 1:] = -1e9                           # only first beam is live at t=0
-            beamScores  = beamScores.view(-1)                  # (B*numBeams,)
+            beamScores[:, 1:] = -1e9
+            beamScores  = beamScores.view(-1)
 
-        # decoder input: BOS token for every beam
             inputIds = torch.full(
                 (batchSize * numBeams, 1),
                 bosTokenId,
@@ -236,8 +273,8 @@ class MTT(nn.Module):
                 device=device
             )
 
-            done        = [False] * batchSize
-            finishedSeqs= [[] for _ in range(batchSize)]       # list of (score, ids) per batch item
+            done         = [False] * batchSize
+            finishedSeqs = [[] for _ in range(batchSize)]
 
             for _ in range(maxNewTokens):
                 decoderOut = self.decoder(
@@ -246,11 +283,11 @@ class MTT(nn.Module):
                     encoder_attention_mask=expandedMask,
                     return_dict=True
                 )
-                logits      = self.lmHead(decoderOut.last_hidden_state[:, -1, :])  # (B*beams, vocab)
-                logProbs    = torch.log_softmax(logits, dim=-1)                    # (B*beams, vocab)
+                logits      = self.lmHead(decoderOut.last_hidden_state[:, -1, :])
+                logProbs    = torch.log_softmax(logits, dim=-1)
 
                 vocabSize   = logProbs.size(-1)
-                nextScores  = beamScores.unsqueeze(-1) + logProbs                  # (B*beams, vocab)
+                nextScores  = beamScores.unsqueeze(-1) + logProbs
                 nextScores  = nextScores.view(batchSize, numBeams * vocabSize)
 
                 topScores, topIndices = torch.topk(nextScores, 2 * numBeams, dim=-1)
@@ -268,8 +305,8 @@ class MTT(nn.Module):
 
                     beamsCounted = 0
                     for score, idx in zip(topScores[b].tolist(), topIndices[b].tolist()):
-                        beamIdx  = idx // vocabSize
-                        tokenIdx = idx  % vocabSize
+                        beamIdx    = idx // vocabSize
+                        tokenIdx   = idx  % vocabSize
                         globalBeam = b * numBeams + beamIdx
 
                         if tokenIdx == eosTokenId:
@@ -293,15 +330,12 @@ class MTT(nn.Module):
                 nextTokens = torch.tensor(nextBeamTokens, dtype=torch.long, device=device).unsqueeze(-1)
                 inputIds   = torch.cat([inputIds[nextBeamOrigins], nextTokens], dim=-1)
 
-        # --- Pick best hypothesis per batch item ---
             translations = []
             for b in range(batchSize):
                 if finishedSeqs[b]:
-                # highest score among completed sequences
-                    best = max(finishedSeqs[b], key=lambda x: x[0])
-                    tokenIds = best[1][1:]                     # strip BOS
+                    best     = max(finishedSeqs[b], key=lambda x: x[0])
+                    tokenIds = best[1][1:]
                 else:
-                # fallback: take the top beam's current sequence
                     tokenIds = inputIds[b * numBeams].tolist()[1:]
 
                 text = self.tokenizer.decode(tokenIds, skip_special_tokens=True)
