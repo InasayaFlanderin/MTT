@@ -29,27 +29,26 @@ from model import MTT
 # ══════════════════════════════════════════════════════════════════════════════
 
 CFG = dict(
-    languages            = ["de", "fr", "vi", "es"],   # paired with "en" + each other
+    languages            = ["de", "fr", "vi", "es"],
     max_samples_per_pair = 50_000,
 
-    train_steps          = 800,    # train steps per cycle (counted after accumulation)
-    test_steps           = 200,    # test  steps per cycle (runs right after train)
+    train_steps          = 800,
+    test_steps           = 200,
 
-    batch_size           = 1,      # micro-batch per forward pass (reduced for 6GB)
-    accum_steps          = 4,      # gradient accumulation → effective batch = 2×4 = 8
+    batch_size           = 1,
+    accum_steps          = 4,
     lr                   = 5e-5,
     grad_clip            = 1.0,
 
-    # ReduceLROnPlateau — fires once per cycle using avg test loss
-    lr_factor            = 0.5,   # new_lr = old_lr * factor  on plateau
-    lr_patience          = 2,     # cycles with no improvement before reducing
-    lr_min               = 1e-7,  # hard floor for LR
+    lr_factor            = 0.5,
+    lr_patience          = 2,
+    lr_min               = 1e-7,
 
     checkpoint_path      = "mtt_checkpoint.pt",
     checkpoint_minutes   = 30.0,
 
-    device               = "cuda" if torch.cuda.is_available() else "cpu",
-    num_workers          = 2,      # lower = less shared memory pressure
+    device               = "cpu",
+    num_workers          = 2,
 )
 
 
@@ -58,8 +57,7 @@ CFG = dict(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _fetch_pair(src: str, tgt: str, split: str, max_n: int) -> list:
-    """Download one language pair from OPUS-100. Returns [(src_text, tgt_text, tgt_lang)]."""
-    from datasets import load_dataset  # lazy — only imported once at startup
+    from datasets import load_dataset
 
     for key in [f"{src}-{tgt}", f"{tgt}-{src}"]:
         try:
@@ -81,11 +79,6 @@ def _fetch_pair(src: str, tgt: str, split: str, max_n: int) -> list:
 
 
 def fetch_all_pairs() -> tuple:
-    """
-    Build every unique language pair from {en, de, fr, vi, es}.
-    Pairs missing from OPUS-100 are created via English pivot.
-    Returns (train_samples, test_samples).
-    """
     max_n     = CFG["max_samples_per_pair"]
     all_langs = CFG["languages"] + ["en"]
 
@@ -93,15 +86,17 @@ def fetch_all_pairs() -> tuple:
                     for i in range(len(all_langs))
                     for j in range(i + 1, len(all_langs))]
 
-    train_all, test_all = [], []
+    # Gom theo target language để balance sau
+    train_by_lang: dict = {}
+    test_by_lang:  dict = {}
 
     for src, tgt in unique_pairs:
         rows = _fetch_pair(src, tgt, "train",      max_n)
         tst  = _fetch_pair(src, tgt, "validation", max_n // 5)
 
         if rows:
-            train_all += rows
-            test_all  += tst
+            train_by_lang.setdefault(tgt, []).extend(rows)
+            test_by_lang.setdefault(tgt,  []).extend(tst)
         elif src != "en" and tgt != "en":
             print(f"  [DATA]  Pivoting {src}→{tgt} through English...")
             en_src    = _fetch_pair("en", src, "train", max_n // 2)
@@ -109,8 +104,27 @@ def fetch_all_pairs() -> tuple:
             en_to_src = {e: s for e, s, _ in en_src}
             pivoted   = [(en_to_src[e], t, tgt)
                          for e, t, _ in en_tgt if e in en_to_src][:max_n]
-            train_all += pivoted
+            train_by_lang.setdefault(tgt, []).extend(pivoted)
             print(f"  [DATA]  Pivoted  {src}→{tgt}  {len(pivoted):>7,}")
+
+    # ── BUG FIX 2: Balance — cap mỗi target lang bằng nhau ───────────────────
+    # Lấy số mẫu nhỏ nhất trong các ngôn ngữ non-English làm mức cap
+    # → English không còn chiếm quá nhiều
+    non_en_counts = [len(v) for k, v in train_by_lang.items() if k != "en"]
+    cap = min(non_en_counts) if non_en_counts else max_n
+    print(f"\n  [DATA]  Balancing — cap mỗi lang = {cap:,} samples")
+
+    train_all, test_all = [], []
+    for lang, samples in train_by_lang.items():
+        random.shuffle(samples)
+        taken = samples[:cap]
+        train_all.extend(taken)
+        print(f"  [DATA]  lang={lang:<4}  train={len(taken):,}")
+
+    for lang, samples in test_by_lang.items():
+        test_cap = max(1, cap // 5)
+        random.shuffle(samples)
+        test_all.extend(samples[:test_cap])
 
     random.shuffle(train_all)
     random.shuffle(test_all)
@@ -124,8 +138,6 @@ def fetch_all_pairs() -> tuple:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TranslationDataset(Dataset):
-    """Each sample: (src_text, tgt_text, tgt_lang, ner_tensor | None)"""
-
     def __init__(self, samples: list):
         self.samples = [s if len(s) == 4 else (*s, None) for s in samples]
 
@@ -148,9 +160,41 @@ def collate_fn(batch):
 
 
 def infinite_loader(loader: DataLoader):
-    """Yields batches forever, reshuffling each epoch."""
     while True:
         yield from loader
+
+
+# ── BUG FIX 1: Sampler đảm bảo mỗi batch chỉ có 1 target language ────────────
+class SameLangSampler(torch.utils.data.Sampler):
+    """
+    Nhóm các index theo target language, shuffle trong từng nhóm,
+    rồi interleave → batch_size bất kỳ cũng không bao giờ mix ngôn ngữ.
+    """
+    def __init__(self, dataset: TranslationDataset):
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for i, sample in enumerate(dataset.samples):
+            groups[sample[2]].append(i)  # sample[2] = tgt_lang
+        self.groups = list(groups.values())
+
+    def __iter__(self):
+        groups = [g[:] for g in self.groups]
+        for g in groups:
+            random.shuffle(g)
+        random.shuffle(groups)
+        iters = [iter(g) for g in groups]
+        while iters:
+            next_iters = []
+            for it in iters:
+                try:
+                    yield next(it)
+                    next_iters.append(it)
+                except StopIteration:
+                    pass
+            iters = next_iters
+
+    def __len__(self):
+        return sum(len(g) for g in self.groups)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -199,12 +243,11 @@ def train(model: MTT,
     device      = CFG["device"]
     ckpt_sec    = CFG["checkpoint_minutes"] * 60
     accum_steps = CFG["accum_steps"]
-    use_amp     = (device == "cuda")
+    use_amp     = (device == "cuda")   # ✅ AMP chỉ dùng trên CUDA
+    use_cuda    = (device == "cuda")
 
     model.to(device)
 
-    # Gradient checkpointing: recompute activations during backward
-    # instead of storing them → saves ~30-40% VRAM at cost of ~20% speed
     if hasattr(model.encoder, "gradient_checkpointing_enable"):
         model.encoder.gradient_checkpointing_enable()
     if hasattr(model.decoder, "gradient_checkpointing_enable"):
@@ -221,24 +264,26 @@ def train(model: MTT,
         min_lr   = CFG["lr_min"],
     )
 
-    # Mixed precision scaler — fp16 cuts VRAM ~50% for activations/gradients
     scaler = GradScaler(device, enabled=use_amp)
 
     global_step, cycle = load_checkpoint(model, optimizer, scheduler, scaler, device)
 
-    use_pin = (device == "cuda")
     loader_kwargs = dict(
         batch_size         = CFG["batch_size"],
         collate_fn         = collate_fn,
         num_workers        = CFG["num_workers"],
-        pin_memory         = use_pin,
+        pin_memory         = use_cuda,
         persistent_workers = CFG["num_workers"] > 0,
     )
-    train_loader = DataLoader(train_dataset, shuffle=True,  **loader_kwargs)
-    test_loader  = DataLoader(test_dataset,  shuffle=False, **loader_kwargs)
+    # BUG FIX 1: dùng SameLangSampler → mỗi batch chỉ có 1 target language
+    train_loader = DataLoader(train_dataset,
+                              sampler=SameLangSampler(train_dataset),
+                              **loader_kwargs)
+    test_loader  = DataLoader(test_dataset,
+                              sampler=SameLangSampler(test_dataset),
+                              **loader_kwargs)
     train_iter   = infinite_loader(train_loader)
 
-    # Graceful Ctrl+C
     stop = False
     def _on_stop(sig, frame):
         nonlocal stop
@@ -259,7 +304,6 @@ def train(model: MTT,
     print(f"  Press Ctrl+C to stop safely at any time")
     print(f"{'═'*64}\n")
 
-    # ── Infinite loop ─────────────────────────────────────────────────────────
     while not stop:
         cycle += 1
 
@@ -268,7 +312,7 @@ def train(model: MTT,
         print(f"{'─'*64}\n")
 
         # ══════════════════════════════════════════════════════════════════════
-        # PHASE 1 — TRAIN  (800 steps)
+        # PHASE 1 — TRAIN
         # ══════════════════════════════════════════════════════════════════════
         model.train()
         train_loss_sum = 0.0
@@ -292,12 +336,11 @@ def train(model: MTT,
                     returnLoss = True,
                     device     = device,
                 )
-                loss = out["loss"] / accum_steps  # normalize for accumulation
+                loss = out["loss"] / accum_steps
 
             scaler.scale(loss).backward()
             accum_loss += loss.item()
 
-            # Optimizer step every accum_steps micro-batches
             if micro_step % accum_steps == 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), CFG["grad_clip"])
@@ -323,13 +366,12 @@ def train(model: MTT,
                 )
                 accum_loss = 0.0
 
-                # Timed checkpoint
                 if time.time() - last_ckpt >= ckpt_sec:
                     save_checkpoint(model, optimizer, scheduler, scaler, global_step, cycle)
                     last_ckpt = time.time()
 
-                # Periodically free VRAM cache
-                if global_step % 50 == 0:
+                # ✅ Chỉ gọi empty_cache khi đang dùng CUDA
+                if use_cuda and global_step % 50 == 0:
                     torch.cuda.empty_cache()
 
         avg_train = train_loss_sum / max(train_step, 1)
@@ -339,7 +381,7 @@ def train(model: MTT,
             break
 
         # ══════════════════════════════════════════════════════════════════════
-        # PHASE 2 — TEST  (200 steps, no gradients)
+        # PHASE 2 — TEST
         # ══════════════════════════════════════════════════════════════════════
         model.eval()
         test_loss_sum  = 0.0
@@ -376,7 +418,9 @@ def train(model: MTT,
                     f"  loss={lv:.4f}"
                 )
 
-        torch.cuda.empty_cache()
+        # ✅ Chỉ gọi empty_cache khi đang dùng CUDA
+        if use_cuda:
+            torch.cuda.empty_cache()
 
         n         = CFG["test_steps"]
         avg_test  = test_loss_sum  / n
@@ -402,7 +446,6 @@ def train(model: MTT,
         save_checkpoint(model, optimizer, scheduler, scaler, global_step, cycle)
         last_ckpt = time.time()
 
-    # ── Final save on Ctrl+C ──────────────────────────────────────────────────
     save_checkpoint(model, optimizer, scheduler, scaler, global_step, cycle)
     print(f"\n  Stopped at global step {global_step}, cycle {cycle}. Goodbye!")
 
@@ -412,7 +455,6 @@ def train(model: MTT,
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # Reduce VRAM fragmentation
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     print("  Fetching data from HuggingFace OPUS-100...\n")
