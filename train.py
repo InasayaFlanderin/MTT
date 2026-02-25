@@ -59,70 +59,120 @@ CFG = dict(
 # DATA FETCHING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _fetch_pair(src: str, tgt: str, split: str, max_n: int) -> list:
-    """Download one language pair from OPUS-100. Returns [(src_text, tgt_text)]."""
+def _fetch_opus(lang: str, split: str, max_n: int) -> list:
+    """
+    Fetch en↔lang from OPUS-100. Returns [(en_text, lang_text)].
+    OPUS-100 always stores pairs as "en-xx" (English on one side).
+    """
     from datasets import load_dataset  # lazy import
 
-    for key in [f"{src}-{tgt}", f"{tgt}-{src}"]:
+    for key in [f"en-{lang}", f"{lang}-en"]:
         try:
             ds  = load_dataset("Helsinki-NLP/opus-100", key, split=split)
             out = []
             for row in ds:
                 t = row["translation"]
-                if src in t and tgt in t:
-                    out.append((t[src], t[tgt]))
+                if "en" in t and lang in t:
+                    out.append((t["en"], t[lang]))
                 if len(out) >= max_n:
                     break
-            print(f"  [DATA]  {src}→{tgt:<4}  {split:<12}  {len(out):>7,}  (key={key})")
+            print(f"  [DATA]  en↔{lang:<4}  {split:<12}  {len(out):>7,}  (key={key})")
             return out
-        except Exception:
+        except Exception as e:
+            print(f"  [DATA]  en↔{lang}  key={key} failed: {e}")
             continue
 
-    print(f"  [DATA]  {src}→{tgt}  not found in OPUS-100, skipping.")
+    print(f"  [DATA]  en↔{lang}  not found in OPUS-100, skipping.")
     return []
 
 
 def fetch_all_pairs() -> tuple:
     """
-    Build every unique language pair from {en, de, fr, vi, es}.
-    Pairs missing from OPUS-100 are built via English pivot.
+    Fetch en↔X for every language X.
+    Stores data in BOTH directions:
+      - under tgt=X : (en_src → X_tgt)   model learns to translate INTO X
+      - under tgt=en: (X_src → en_tgt)   model learns to translate INTO en
+    Also builds cross-language pairs via English pivot and stores them
+    under the correct target language with proper test splits.
 
     Returns:
         train_by_lang : { tgt_lang -> [(src_text, tgt_text), ...] }
         test_by_lang  : { tgt_lang -> [(src_text, tgt_text), ...] }
-
-    Batches drawn from each language's loader are guaranteed monolingual —
-    langs[0] is always correct for every sample in the batch.
     """
     max_n     = CFG["max_samples_per_pair"]
-    all_langs = CFG["languages"] + ["en"]
-
-    unique_pairs = [
-        (all_langs[i], all_langs[j])
-        for i in range(len(all_langs))
-        for j in range(i + 1, len(all_langs))
-    ]
+    langs     = CFG["languages"]   # ["de", "fr", "vi", "es"]
 
     train_by_lang: dict[str, list] = {}
     test_by_lang:  dict[str, list] = {}
 
-    for src, tgt in unique_pairs:
-        rows = _fetch_pair(src, tgt, "train",      max_n)
-        tst  = _fetch_pair(src, tgt, "validation", max_n // 5)
+    # Cache en↔X data so we don't re-download for pivot
+    cache_train: dict[str, list] = {}   # lang -> [(en, lang_text)]
+    cache_test:  dict[str, list] = {}
 
-        if rows:
-            train_by_lang.setdefault(tgt, []).extend(rows)
-            test_by_lang.setdefault(tgt,  []).extend(tst)
-        elif src != "en" and tgt != "en":
-            # Pivot: src→en + en→tgt matched by English sentence
-            print(f"  [DATA]  Pivoting {src}→{tgt} through English...")
-            en_src    = _fetch_pair("en", src, "train", max_n // 2)
-            en_tgt    = _fetch_pair("en", tgt, "train", max_n // 2)
-            en_to_src = {e: s for e, s in en_src}
-            pivoted   = [(en_to_src[e], t)
-                         for e, t in en_tgt if e in en_to_src][:max_n]
-            train_by_lang.setdefault(tgt, []).extend(pivoted)
-            print(f"  [DATA]  Pivoted  {src}→{tgt}  {len(pivoted):>7,}")
+    # ── Step 1: fetch en↔X for every X ────────────────────────────────────────
+    for lang in langs:
+        train_rows = _fetch_opus(lang, "train",      max_n)
+        test_rows  = _fetch_opus(lang, "validation", max_n // 5)
+
+        cache_train[lang] = train_rows
+        cache_test[lang]  = test_rows
+
+        if not train_rows:
+            print(f"  [DATA]  WARNING: no data for {lang}, skipping.")
+            continue
+
+        # en → lang  (model learns to produce lang)
+        train_by_lang.setdefault(lang, []).extend(
+            [(en, lx) for en, lx in train_rows]
+        )
+        test_by_lang.setdefault(lang, []).extend(
+            [(en, lx) for en, lx in test_rows]
+        )
+
+        # lang → en  (model learns to produce en)
+        train_by_lang.setdefault("en", []).extend(
+            [(lx, en) for en, lx in train_rows]
+        )
+        test_by_lang.setdefault("en", []).extend(
+            [(lx, en) for en, lx in test_rows]
+        )
+
+    # ── Step 2: cross-language pairs via English pivot ─────────────────────────
+    # For every pair (l1, l2), build l1→l2 by matching on the English sentence.
+    # Both train AND test are pivoted so test sets are never empty.
+    for i in range(len(langs)):
+        for j in range(i + 1, len(langs)):
+            l1, l2 = langs[i], langs[j]
+            if not cache_train.get(l1) or not cache_train.get(l2):
+                continue
+
+            print(f"  [DATA]  Pivoting {l1}→{l2} and {l2}→{l1} through English...")
+
+            # train pivot
+            en_to_l1 = {en: lx for en, lx in cache_train[l1]}
+            en_to_l2 = {en: lx for en, lx in cache_train[l2]}
+            common   = set(en_to_l1) & set(en_to_l2)
+
+            pivot_l1_l2 = [(en_to_l1[e], en_to_l2[e]) for e in common][:max_n]
+            pivot_l2_l1 = [(en_to_l2[e], en_to_l1[e]) for e in common][:max_n]
+            random.shuffle(pivot_l1_l2)
+            random.shuffle(pivot_l2_l1)
+
+            # test pivot
+            en_to_l1_t = {en: lx for en, lx in cache_test.get(l1, [])}
+            en_to_l2_t = {en: lx for en, lx in cache_test.get(l2, [])}
+            common_t   = set(en_to_l1_t) & set(en_to_l2_t)
+
+            pivot_l1_l2_t = [(en_to_l1_t[e], en_to_l2_t[e]) for e in common_t][:max_n // 5]
+            pivot_l2_l1_t = [(en_to_l2_t[e], en_to_l1_t[e]) for e in common_t][:max_n // 5]
+
+            train_by_lang.setdefault(l2, []).extend(pivot_l1_l2)
+            train_by_lang.setdefault(l1, []).extend(pivot_l2_l1)
+            test_by_lang.setdefault(l2,  []).extend(pivot_l1_l2_t)
+            test_by_lang.setdefault(l1,  []).extend(pivot_l2_l1_t)
+
+            print(f"  [DATA]  Pivoted  {l1}→{l2}  train={len(pivot_l1_l2):,}  test={len(pivot_l1_l2_t):,}")
+            print(f"  [DATA]  Pivoted  {l2}→{l1}  train={len(pivot_l2_l1):,}  test={len(pivot_l2_l1_t):,}")
 
     for lang in train_by_lang:
         random.shuffle(train_by_lang[lang])
