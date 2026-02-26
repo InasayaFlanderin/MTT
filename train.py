@@ -12,17 +12,107 @@ Install:
     pip install torch datasets sentencepiece transformers
 """
 
+import math
 import os
 import random
 import signal
 import time
 
+import spacy
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torch.amp import GradScaler, autocast
 
 from model import MTT
+
+
+# ── spaCy label → nerVocab key ────────────────────────────────────────────────
+_SPACY_TO_NER = {
+    "PERSON": "PERSON", "PER": "PERSON",
+    "ORG": "ORG", "LOC": "LOC", "GPE": "GPE",
+    "DATE": "DATE", "MONEY": "MONEY", "PERCENT": "PERCENT",
+    "TIME": "TIME", "QUANTITY": "QUANTITY", "CARDINAL": "QUANTITY",
+}
+
+
+def _load_spacy(model_name: str = "xx_ent_wiki_sm"):
+    """Load spaCy multilingual NER model (disable unneeded pipes)."""
+    try:
+        nlp = spacy.load(model_name, disable=["tagger", "parser", "senter", "lemmatizer"])
+        print(f"  [NER ]  spaCy '{model_name}' loaded.")
+        return nlp
+    except OSError:
+        print(f"  [NER ]  Model '{model_name}' not found. Run:")
+        print(f"          python -m spacy download {model_name}")
+        raise
+
+
+def _extract_ner_tags(
+    src_texts  : list[str],
+    target_lang: str,
+    nlp,
+    tokenizer,
+    ner_vocab  : dict,
+    max_length : int = 128,
+    device     : str = "cpu",
+) -> torch.Tensor:
+    """
+    1. Chạy spaCy NER trên src_texts (nguyên văn, không có prefix).
+    2. Tokenize tagged_src (có prefix <2lang>) với return_offsets_mapping=True.
+    3. Dùng offset để map từng subword → entity tag id.
+
+    Returns: LongTensor [B, seq_len]
+      -100  → special token / prefix token / padding  (ignored by cross_entropy)
+         0  → 'O' (mặc định)
+      1..N  → entity class
+    """
+    prefix     = f"<2{target_lang}> "
+    prefix_len = len(prefix)
+    tagged_src = [prefix + t for t in src_texts]
+
+    # Bước 1: spaCy → char-level tag map
+    char_tag_maps = []
+    for doc in nlp.pipe(src_texts, batch_size=32):
+        char_tags: dict[int, int] = {}
+        for ent in doc.ents:
+            tag_id = ner_vocab.get(_SPACY_TO_NER.get(ent.label_, ""), 0)
+            if tag_id:
+                for c in range(ent.start_char, ent.end_char):
+                    char_tags[c] = tag_id
+        char_tag_maps.append(char_tags)
+
+    # Bước 2: tokenize với offset_mapping
+    enc = tokenizer(
+        tagged_src,
+        padding               = True,
+        truncation            = True,
+        max_length            = max_length,
+        return_tensors        = "pt",
+        return_offsets_mapping= True,
+    )
+
+    B, seq_len = enc.input_ids.shape
+    tag_tensor = torch.full((B, seq_len), -100, dtype=torch.long)
+
+    for i in range(B):
+        for j in range(seq_len):
+            start, end = enc.offset_mapping[i, j].tolist()
+            if start == 0 and end == 0:        # special token
+                continue
+            if end <= prefix_len:              # prefix <2lang>
+                continue
+            # subword thuộc source text
+            src_start = start - prefix_len
+            src_end   = end   - prefix_len
+            tag = 0
+            for c in range(max(0, src_start), src_end):
+                if c in char_tag_maps[i]:
+                    tag = char_tag_maps[i][c]
+                    break
+            tag_tensor[i, j] = tag
+
+    return tag_tensor.to(device)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -41,10 +131,9 @@ CFG = dict(
     lr                   = 5e-5,
     grad_clip            = 1.0,
 
-    # ReduceLROnPlateau — fires once per cycle using avg test loss
-    lr_factor            = 0.5,
-    lr_patience          = 2,
-    lr_min               = 1e-7,
+    # Warmup + Cosine Decay (restart mỗi cycle)
+    warmup_steps         = 400,    # optimizer steps để linear warm-up
+    lr_min               = 1e-7,   # sàn LR trong cosine phase
 
     checkpoint_path      = "mtt_checkpoint.pt",
     checkpoint_minutes   = 30.0,
@@ -120,6 +209,10 @@ def fetch_all_pairs() -> tuple:
         if not train_rows:
             print(f"  [DATA]  WARNING: no data for {lang}, skipping.")
             continue
+
+        # Dedup test vs train (kiểm tra hash để chắc chắn không overlap)
+        train_keys = {s + "|||" + t for s, t in train_rows}
+        test_rows  = [(s, t) for s, t in test_rows if s + "|||" + t not in train_keys]
 
         # en → lang  (model learns to produce lang)
         train_by_lang.setdefault(lang, []).extend(
@@ -278,7 +371,8 @@ def load_checkpoint(model, optimizer, scheduler, scaler, device: str) -> tuple:
 
 def train(model: MTT,
           train_by_lang: dict,
-          test_by_lang:  dict):
+          test_by_lang:  dict,
+          nlp = None):
 
     device      = CFG["device"]
     ckpt_sec    = CFG["checkpoint_minutes"] * 60
@@ -296,13 +390,16 @@ def train(model: MTT,
     optimizer = optim.AdamW(model.parameters(),
                             lr=CFG["lr"], weight_decay=1e-2)
 
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode     = "min",
-        factor   = CFG["lr_factor"],
-        patience = CFG["lr_patience"],
-        min_lr   = CFG["lr_min"],
-    )
+    # Warmup linear → cosine decay, restart mỗi cycle
+    _warmup  = CFG["warmup_steps"]
+    _cycle   = CFG["train_steps"]
+    _min_r   = CFG["lr_min"] / CFG["lr"]
+    def _lr_lambda(step: int) -> float:
+        if step < _warmup:
+            return step / max(1, _warmup)
+        pos = (step - _warmup) % _cycle
+        return _min_r + (1 - _min_r) * 0.5 * (1 + math.cos(math.pi * pos / _cycle))
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
 
     scaler = GradScaler(device, enabled=use_amp)
 
@@ -336,7 +433,8 @@ def train(model: MTT,
     print(f"  Cycle = {CFG['train_steps']} train steps + {CFG['test_steps']} test steps")
     print(f"  Each step = one monolingual batch (one language, always correct)")
     print(f"  Languages : {train_langs}")
-    print(f"  LR auto-adjusted via ReduceLROnPlateau after every cycle")
+    print(f"  LR: warmup {CFG['warmup_steps']} steps → cosine/cycle → min={CFG['lr_min']:.1e}")
+    print(f"  NER: spaCy → offset_mapping align → forward() nerTags")
     print(f"  Checkpoint every {CFG['checkpoint_minutes']} min + end of each cycle")
     print(f"  Press Ctrl+C to stop safely at any time")
     print(f"{'═'*64}\n")
@@ -376,12 +474,24 @@ def train(model: MTT,
             langs_in_step.append(lang)
             srcs, tgts = next(train_iters[lang])
 
+            # ── NER: spaCy → align offset → nerTags ──────────────────────────
+            ner_tags = None
+            if nlp is not None:
+                try:
+                    ner_tags = _extract_ner_tags(
+                        src_texts=srcs, target_lang=lang, nlp=nlp,
+                        tokenizer=model.tokenizer, ner_vocab=model.nerVocab,
+                        max_length=128, device=device,
+                    )
+                except Exception as e:
+                    print(f"  [NER ]  WARNING: {e} — skipping nerTags this step")
+
             with autocast(device, enabled=use_amp):
                 out  = model(
                     srcText    = srcs,
                     targetLang = lang,      # entire batch is this language
                     targetText = tgts,
-                    nerTags    = None,
+                    nerTags    = ner_tags,
                     returnLoss = True,
                     device     = device,
                 )
@@ -395,6 +505,7 @@ def train(model: MTT,
                 torch.nn.utils.clip_grad_norm_(model.parameters(), CFG["grad_clip"])
                 scaler.step(optimizer)
                 scaler.update()
+                scheduler.step()           # warmup + cosine per optimizer step
                 optimizer.zero_grad(set_to_none=True)
 
                 global_step    += 1
@@ -450,12 +561,24 @@ def train(model: MTT,
             for test_step, lang in enumerate(test_schedule, 1):
                 srcs, tgts = next(test_iters[lang])
 
+                # ── NER cho test ──────────────────────────────────────────────
+                ner_tags = None
+                if nlp is not None:
+                    try:
+                        ner_tags = _extract_ner_tags(
+                            src_texts=srcs, target_lang=lang, nlp=nlp,
+                            tokenizer=model.tokenizer, ner_vocab=model.nerVocab,
+                            max_length=128, device=device,
+                        )
+                    except Exception:
+                        pass
+
                 with autocast(device, enabled=use_amp):
                     out = model(
                         srcText    = srcs,
                         targetLang = lang,
                         targetText = tgts,
-                        nerTags    = None,
+                        nerTags    = ner_tags,
                         returnLoss = True,
                         device     = device,
                     )
@@ -483,19 +606,8 @@ def train(model: MTT,
         avg_trans = test_trans_sum / n
         avg_ner   = test_ner_sum   / n
         print(f"\n  [CYCLE {cycle}]  ── Test done ──  "
-              f"avg loss: {avg_test:.4f}  trans: {avg_trans:.4f}  ner: {avg_ner:.4f}")
-
-        # ══════════════════════════════════════════════════════════════════════
-        # PHASE 3 — AUTO ADJUST LR  (based on avg test loss)
-        # ══════════════════════════════════════════════════════════════════════
-        prev_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step(avg_test)
-        new_lr  = optimizer.param_groups[0]["lr"]
-
-        if new_lr < prev_lr:
-            print(f"  [LR  ]  Reduced  {prev_lr:.2e}  →  {new_lr:.2e}  (plateau)")
-        else:
-            print(f"  [LR  ]  Holding  {new_lr:.2e}  (still improving)")
+              f"avg loss: {avg_test:.4f}  trans: {avg_trans:.4f}  ner: {avg_ner:.4f}  "
+              f"lr={optimizer.param_groups[0]['lr']:.2e}")
 
         print()
         save_checkpoint(model, optimizer, scheduler, scaler, global_step, cycle)
@@ -512,10 +624,12 @@ def train(model: MTT,
 if __name__ == "__main__":
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+    nlp = _load_spacy("xx_ent_wiki_sm")
+
     print("  Fetching data from HuggingFace OPUS-100...\n")
     train_by_lang, test_by_lang = fetch_all_pairs()
 
     model = MTT()
     model.paramsCalc()
 
-    train(model, train_by_lang, test_by_lang)
+    train(model, train_by_lang, test_by_lang, nlp)
