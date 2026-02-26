@@ -321,6 +321,25 @@ class DataManager:
         return pool[lang].sample(n)
 
 
+def make_lang_loaders(by_lang: dict, batch_size: int,
+                      num_workers: int, pin_memory: bool,
+                      shuffle: bool) -> dict:
+    """Build one infinite iterator per language."""
+    return {
+        lang: _infinite(DataLoader(
+            MonolingualDataset(samples),
+            batch_size         = batch_size,
+            shuffle            = shuffle,
+            collate_fn         = collate_fn,
+            num_workers        = num_workers,
+            pin_memory         = pin_memory,
+            persistent_workers = num_workers > 0,
+            drop_last          = True,
+        ))
+        for lang, samples in by_lang.items()
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  NER TAG ALIGNMENT
 # ══════════════════════════════════════════════════════════════════════════════
