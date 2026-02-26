@@ -390,52 +390,69 @@ def compute_loss(
     ner_samples: List[Tuple[List[str], List[int]]],
 ) -> Tuple[torch.Tensor, float, float]:
     """
-    Run one mini-batch forward pass.
+    Run one mini-batch forward pass with TWO separate sub-batches:
 
-    Translation and NER use separate sub-batches inside the same step:
-      - Translation forward: srcText + targetText → translationLoss
-      - NER forward: wikiann texts → nerLogits → nerLoss (F.cross_entropy)
-    Total loss = translationLoss + NER_WEIGHT × nerLoss
+    1) Translation sub-batch (src_texts → tgt_texts):
+       - nerTags=None  →  model dùng predicted tags cho nerEmbeds (inference mode)
+       - trả về translationLoss
+
+    2) NER sub-batch (wikiann texts):
+       - Tokenize trước để biết seq_len thực tế
+       - Align ground-truth WikiANN tags về đúng seq_len đó
+       - Truyền nerTags vào forward → model tự tính nerLoss bên trong
+         (đồng thời dùng ground-truth tags làm nerEmbeds, tốt hơn predicted)
+       - targetText=None → translationLoss=None, chỉ lấy nerLoss
+
+    Total = translationLoss + NER_WEIGHT × nerLoss
 
     Returns:
         (total_loss_tensor, trans_loss_float, ner_loss_float)
     """
-    # ── Translation ──────────────────────────────────────────────────────────
-    trans_out  = model.forward(
+    # ── 1. Translation forward ────────────────────────────────────────────────
+    trans_out = model.forward(
         srcText    = src_texts,
         targetLang = tgt_lang,
         targetText = tgt_texts,
-        nerTags    = None,
+        nerTags    = None,       # không có WikiANN labels cho parallel corpus
         returnLoss = True,
         device     = DEVICE,
     )
     trans_loss: torch.Tensor = trans_out["translationLoss"]
 
-    # ── NER ──────────────────────────────────────────────────────────────────
+    # ── 2. NER forward ────────────────────────────────────────────────────────
     ner_texts = [" ".join(s[0]) for s in ner_samples]
-    ner_out   = model.forward(
-        srcText    = ner_texts,
-        targetLang = tgt_lang,         # just needs a valid lang token
-        targetText = None,
-        nerTags    = None,
-        returnLoss = False,
-        device     = DEVICE,
-    )
-    ner_logits: torch.Tensor = ner_out["nerLogits"]   # (B, seq, num_tags)
-    seq_len = ner_logits.size(1)
 
+    # Tokenize trước (không sang model) để xác định seq_len thực tế
+    # Model sẽ prepend <2lang> nên ta cần tính +1 cho lang token
+    ner_encoded = model.tokenizer(
+        [f"<2{tgt_lang}> {t}" for t in ner_texts],
+        return_tensors = "pt",
+        padding        = True,
+        truncation     = True,
+        max_length     = MAX_LEN,
+    )
+    seq_len = ner_encoded.input_ids.size(1)
+
+    # Align ground-truth tags → (batch, seq_len), ignored positions = -100
     ner_tag_tensor = align_ner_tags(
         [s[0] for s in ner_samples],
         [s[1] for s in ner_samples],
         seq_len,
-    ).to(DEVICE)
+    )  # còn ở CPU, model.forward sẽ .to(device) bên trong
 
-    ner_loss: torch.Tensor = F.cross_entropy(
-        ner_logits.view(-1, ner_logits.size(-1)),
-        ner_tag_tensor.view(-1),
-        ignore_index=-100,
+    # Forward với nerTags thật → model tính nerLoss và dùng ground-truth
+    # tags làm nerEmbeds (thay vì predicted) → supervision đúng nghĩa
+    ner_out = model.forward(
+        srcText    = ner_texts,
+        targetLang = tgt_lang,
+        targetText = None,          # không cần decoder loss ở đây
+        nerTags    = ner_tag_tensor,
+        returnLoss = False,         # tổng loss sẽ tính thủ công bên dưới
+        device     = DEVICE,
     )
+    ner_loss: torch.Tensor = ner_out["nerLoss"]  # đã được tính bên trong model
 
+    # ── Tổng loss ─────────────────────────────────────────────────────────────
     total = trans_loss + NER_WEIGHT * ner_loss
     return total, trans_loss.item(), ner_loss.item()
 
