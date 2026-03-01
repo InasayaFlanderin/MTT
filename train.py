@@ -160,8 +160,8 @@ CFG = dict(
     max_samples_per_pair=50_000,
     train_steps=10000,  # train steps per cycle
     test_steps=200,  # test  steps per cycle (runs right after train)
-    batch_size=8,
-    accum_steps=4,  # gradient accumulation → effective batch = 4×4 = 16
+    batch_size=16,
+    accum_steps=8,  # gradient accumulation → effective batch = 4×4 = 16
     lr=5e-5,
     grad_clip=1.0,
     # Warmup + Cosine Decay (restart mỗi cycle)
