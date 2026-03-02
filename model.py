@@ -65,20 +65,6 @@ class MTT(nn.Module):
 
     @classmethod
     def load(cls, checkpoint_path: str, device: str = "cpu") -> "MTT":
-        """
-        Tạo model mới rồi load weights từ file checkpoint của train.py.
-
-        Ví dụ:
-            model = MTT.load("mtt_checkpoint.pt", device="cpu")
-            model.eval()
-
-        Args:
-            checkpoint_path : đường dẫn tới file .pt do train.py lưu
-            device          : "cpu" hoặc "cuda"
-
-        Returns:
-            MTT instance đã load weights, ở chế độ eval
-        """
         if not torch.cuda.is_available() and device == "cuda":
             print("[LOAD] CUDA không khả dụng, chuyển sang CPU.")
             device = "cpu"
@@ -89,14 +75,12 @@ class MTT(nn.Module):
         print(f"[LOAD] Đang load checkpoint: {checkpoint_path}")
         ckpt = torch.load(checkpoint_path, map_location=device)
 
-        # Checkpoint từ train.py lưu key "model" chứa state_dict
         if "model" in ckpt:
             state_dict = ckpt["model"]
             print(f"[LOAD] Global step : {ckpt.get('global_step', '?')}")
             print(f"[LOAD] Cycle        : {ckpt.get('cycle', '?')}")
             print(f"[LOAD] LR cuối      : {ckpt.get('lr', '?')}")
         else:
-            # Nếu file là raw state_dict (lưu thẳng không qua train.py)
             state_dict = ckpt
 
         model.load_state_dict(state_dict)
@@ -118,7 +102,6 @@ class MTT(nn.Module):
         print("Total: ", encoderPara + embedPara + nerPara + proPara + decoderPara + lmPara)
 
     def _shiftRight(self, inputIds: torch.Tensor) -> torch.Tensor:
-        """Shift input ids one position right, prepend decoder_start_token_id (teacher forcing)."""
         shifted = inputIds.new_zeros(inputIds.shape)
         shifted[:, 1:] = inputIds[:, :-1].clone()
         shifted[:, 0]  = self.decoderStartTokenId
@@ -319,6 +302,15 @@ class MTT(nn.Module):
 
                         if beamsCounted == numBeams:
                             break
+
+                    # ── FIX: padding nếu tất cả candidates đều là EOS ────────
+                    # Không có padding → tensor size sai → CRASH
+                    while beamsCounted < numBeams:
+                        nextBeamScores.append(-1e9)
+                        nextBeamTokens.append(padTokenId)
+                        nextBeamOrigins.append(b * numBeams)  # fallback beam 0
+                        beamsCounted += 1
+                    # ─────────────────────────────────────────────────────────
 
                     if len(finishedSeqs[b]) >= numBeams:
                         done[b] = True

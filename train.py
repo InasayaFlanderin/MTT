@@ -12,6 +12,7 @@ Install:
     pip install torch datasets sentencepiece transformers
 """
 
+import gc
 import math
 import os
 import random
@@ -44,7 +45,6 @@ _SPACY_TO_NER = {
 
 
 def _load_spacy(model_name: str = "xx_ent_wiki_sm"):
-    """Load spaCy multilingual NER model (disable unneeded pipes)."""
     try:
         nlp = spacy.load(
             model_name, disable=["tagger", "parser", "senter", "lemmatizer"]
@@ -66,21 +66,10 @@ def _extract_ner_tags(
     max_length: int = 128,
     device: str = "cpu",
 ) -> torch.Tensor:
-    """
-    1. Chạy spaCy NER trên src_texts (nguyên văn, không có prefix).
-    2. Tokenize tagged_src (có prefix <2lang>) với return_offsets_mapping=True.
-    3. Dùng offset để map từng subword → entity tag id.
-
-    Returns: LongTensor [B, seq_len]
-      -100  → special token / prefix token / padding  (ignored by cross_entropy)
-         0  → 'O' (mặc định)
-      1..N  → entity class
-    """
     prefix = f"<2{target_lang}> "
     prefix_len = len(prefix)
     tagged_src = [prefix + t for t in src_texts]
 
-    # Bước 1: spaCy → char-level tag map
     char_tag_maps = []
     for doc in nlp.pipe(src_texts, batch_size=32):
         char_tags: dict[int, int] = {}
@@ -91,7 +80,6 @@ def _extract_ner_tags(
                     char_tags[c] = tag_id
         char_tag_maps.append(char_tags)
 
-    # Bước 2: tokenize với offset_mapping
     enc = tokenizer(
         tagged_src,
         padding=True,
@@ -107,11 +95,10 @@ def _extract_ner_tags(
     for i in range(B):
         for j in range(seq_len):
             start, end = enc.offset_mapping[i, j].tolist()
-            if start == 0 and end == 0:  # special token
+            if start == 0 and end == 0:
                 continue
-            if end <= prefix_len:  # prefix <2lang>
+            if end <= prefix_len:
                 continue
-            # subword thuộc source text
             src_start = start - prefix_len
             src_end = end - prefix_len
             tag = 0
@@ -126,18 +113,9 @@ def _extract_ner_tags(
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AMP DTYPE SELECTION
-# ── fp16  → NaN-prone trên T4/V100 vì range hẹp (±65504)
-# ── bf16  → an toàn hơn (range như fp32), cần Ampere+ (A100, RTX 30xx, L4)
-# ── fp32  → chậm nhất nhưng luôn ổn định, dùng khi GPU không hỗ trợ bf16
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _pick_amp_dtype(device: str):
-    """
-    Trả về (use_amp, amp_dtype):
-      - bf16 nếu GPU hỗ trợ  → nhanh + ổn định
-      - fp32 (AMP tắt) nếu không → không bao giờ NaN
-    fp16 bị loại bỏ hoàn toàn.
-    """
     if device != "cuda":
         return False, torch.float32
 
@@ -156,17 +134,16 @@ def _pick_amp_dtype(device: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 CFG = dict(
-    languages=["de", "fr", "vi", "es"],  # paired with "en" + each other
+    languages=["de", "fr", "vi", "es"],
     max_samples_per_pair=50_000,
-    train_steps=10000,  # train steps per cycle
-    test_steps=200,  # test  steps per cycle (runs right after train)
+    train_steps=10000,
+    test_steps=200,
     batch_size=16,
-    accum_steps=8,  # gradient accumulation → effective batch = 4×4 = 16
+    accum_steps=8,
     lr=5e-5,
     grad_clip=1.0,
-    # Warmup + Cosine Decay (restart mỗi cycle)
-    warmup_steps=400,  # optimizer steps để linear warm-up
-    lr_min=1e-7,  # sàn LR trong cosine phase
+    warmup_steps=400,
+    lr_min=1e-7,
     checkpoint_path="mtt_checkpoint.pt",
     checkpoint_minutes=30.0,
     device="cuda" if torch.cuda.is_available() else "cpu",
@@ -180,11 +157,7 @@ CFG = dict(
 
 
 def _fetch_opus(lang: str, split: str, max_n: int) -> list:
-    """
-    Fetch en↔lang from OPUS-100. Returns [(en_text, lang_text)].
-    OPUS-100 always stores pairs as "en-xx" (English on one side).
-    """
-    from datasets import load_dataset  # lazy import
+    from datasets import load_dataset
 
     for key in [f"en-{lang}", f"{lang}-en"]:
         try:
@@ -207,29 +180,15 @@ def _fetch_opus(lang: str, split: str, max_n: int) -> list:
 
 
 def fetch_all_pairs() -> tuple:
-    """
-    Fetch en↔X for every language X.
-    Stores data in BOTH directions:
-      - under tgt=X : (en_src → X_tgt)   model learns to translate INTO X
-      - under tgt=en: (X_src → en_tgt)   model learns to translate INTO en
-    Also builds cross-language pairs via English pivot and stores them
-    under the correct target language with proper test splits.
-
-    Returns:
-        train_by_lang : { tgt_lang -> [(src_text, tgt_text), ...] }
-        test_by_lang  : { tgt_lang -> [(src_text, tgt_text), ...] }
-    """
     max_n = CFG["max_samples_per_pair"]
-    langs = CFG["languages"]  # ["de", "fr", "vi", "es"]
+    langs = CFG["languages"]
 
     train_by_lang: dict[str, list] = {}
     test_by_lang: dict[str, list] = {}
 
-    # Cache en↔X data so we don't re-download for pivot
-    cache_train: dict[str, list] = {}  # lang -> [(en, lang_text)]
+    cache_train: dict[str, list] = {}
     cache_test: dict[str, list] = {}
 
-    # ── Step 1: fetch en↔X for every X ────────────────────────────────────────
     for lang in langs:
         train_rows = _fetch_opus(lang, "train", max_n)
         test_rows = _fetch_opus(lang, "validation", max_n // 5)
@@ -241,21 +200,15 @@ def fetch_all_pairs() -> tuple:
             print(f"  [DATA]  WARNING: no data for {lang}, skipping.")
             continue
 
-        # Dedup test vs train (kiểm tra hash để chắc chắn không overlap)
         train_keys = {s + "|||" + t for s, t in train_rows}
         test_rows = [(s, t) for s, t in test_rows if s + "|||" + t not in train_keys]
 
-        # en → lang  (model learns to produce lang)
         train_by_lang.setdefault(lang, []).extend([(en, lx) for en, lx in train_rows])
         test_by_lang.setdefault(lang, []).extend([(en, lx) for en, lx in test_rows])
 
-        # lang → en  (model learns to produce en)
         train_by_lang.setdefault("en", []).extend([(lx, en) for en, lx in train_rows])
         test_by_lang.setdefault("en", []).extend([(lx, en) for en, lx in test_rows])
 
-    # ── Step 2: cross-language pairs via English pivot ─────────────────────────
-    # For every pair (l1, l2), build l1→l2 by matching on the English sentence.
-    # Both train AND test are pivoted so test sets are never empty.
     for i in range(len(langs)):
         for j in range(i + 1, len(langs)):
             l1, l2 = langs[i], langs[j]
@@ -264,7 +217,6 @@ def fetch_all_pairs() -> tuple:
 
             print(f"  [DATA]  Pivoting {l1}→{l2} and {l2}→{l1} through English...")
 
-            # train pivot
             en_to_l1 = {en: lx for en, lx in cache_train[l1]}
             en_to_l2 = {en: lx for en, lx in cache_train[l2]}
             common = set(en_to_l1) & set(en_to_l2)
@@ -274,29 +226,20 @@ def fetch_all_pairs() -> tuple:
             random.shuffle(pivot_l1_l2)
             random.shuffle(pivot_l2_l1)
 
-            # test pivot
             en_to_l1_t = {en: lx for en, lx in cache_test.get(l1, [])}
             en_to_l2_t = {en: lx for en, lx in cache_test.get(l2, [])}
             common_t = set(en_to_l1_t) & set(en_to_l2_t)
 
-            pivot_l1_l2_t = [(en_to_l1_t[e], en_to_l2_t[e]) for e in common_t][
-                : max_n // 5
-            ]
-            pivot_l2_l1_t = [(en_to_l2_t[e], en_to_l1_t[e]) for e in common_t][
-                : max_n // 5
-            ]
+            pivot_l1_l2_t = [(en_to_l1_t[e], en_to_l2_t[e]) for e in common_t][: max_n // 5]
+            pivot_l2_l1_t = [(en_to_l2_t[e], en_to_l1_t[e]) for e in common_t][: max_n // 5]
 
             train_by_lang.setdefault(l2, []).extend(pivot_l1_l2)
             train_by_lang.setdefault(l1, []).extend(pivot_l2_l1)
             test_by_lang.setdefault(l2, []).extend(pivot_l1_l2_t)
             test_by_lang.setdefault(l1, []).extend(pivot_l2_l1_t)
 
-            print(
-                f"  [DATA]  Pivoted  {l1}→{l2}  train={len(pivot_l1_l2):,}  test={len(pivot_l1_l2_t):,}"
-            )
-            print(
-                f"  [DATA]  Pivoted  {l2}→{l1}  train={len(pivot_l2_l1):,}  test={len(pivot_l2_l1_t):,}"
-            )
+            print(f"  [DATA]  Pivoted  {l1}→{l2}  train={len(pivot_l1_l2):,}  test={len(pivot_l1_l2_t):,}")
+            print(f"  [DATA]  Pivoted  {l2}→{l1}  train={len(pivot_l2_l1):,}  test={len(pivot_l2_l1_t):,}")
 
     for lang in train_by_lang:
         random.shuffle(train_by_lang[lang])
@@ -315,24 +258,19 @@ def fetch_all_pairs() -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATASET  — one dataset per language, all samples share the same target lang
+# DATASET
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 class MonolingualDataset(Dataset):
-    """
-    Every sample in this dataset has the same target language.
-    One batch = one language = one clean forward pass, no grouping needed.
-    """
-
     def __init__(self, samples: list):
-        self.samples = samples  # [(src_text, tgt_text), ...]
+        self.samples = samples
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        return self.samples[idx]  # (src_text, tgt_text)
+        return self.samples[idx]
 
 
 def collate_fn(batch):
@@ -341,7 +279,6 @@ def collate_fn(batch):
 
 
 def _infinite(loader: DataLoader):
-    """Yield batches forever, reshuffling each epoch."""
     while True:
         yield from loader
 
@@ -349,7 +286,6 @@ def _infinite(loader: DataLoader):
 def make_lang_loaders(
     by_lang: dict, batch_size: int, num_workers: int, pin_memory: bool, shuffle: bool
 ) -> dict:
-    """Build one infinite iterator per language."""
     return {
         lang: _infinite(
             DataLoader(
@@ -421,8 +357,6 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
     ckpt_sec = CFG["checkpoint_minutes"] * 60
     accum_steps = CFG["accum_steps"]
 
-    # ── Chọn AMP dtype: bf16 nếu được, không thì tắt AMP dùng fp32 ──────────
-    # fp16 bị loại bỏ hoàn toàn vì dễ NaN với loss scale lớn
     use_amp, amp_dtype = _pick_amp_dtype(device)
     use_pin = device == "cuda"
 
@@ -435,7 +369,6 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
 
     optimizer = optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=1e-2)
 
-    # Warmup linear → cosine decay, restart mỗi cycle
     _warmup = CFG["warmup_steps"]
     _cycle = CFG["train_steps"]
     _min_r = CFG["lr_min"] / CFG["lr"]
@@ -448,12 +381,12 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
 
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
 
-    # GradScaler chỉ có ý nghĩa với fp16; với bf16/fp32 vẫn tạo nhưng enabled=False
-    scaler = GradScaler(device, enabled=False)
+    # ── FIX 1: GradScaler không nhận positional arg 'device' (PyTorch >= 2.3) ─
+    scaler = GradScaler(enabled=False)
+    # ──────────────────────────────────────────────────────────────────────────
 
     global_step, cycle = load_checkpoint(model, optimizer, scheduler, scaler, device)
 
-    # One infinite iterator per language for train and test
     train_iters = make_lang_loaders(
         train_by_lang, CFG["batch_size"], CFG["num_workers"], use_pin, shuffle=True
     )
@@ -461,11 +394,9 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
         test_by_lang, CFG["batch_size"], CFG["num_workers"], use_pin, shuffle=False
     )
 
-    # Round-robin order so all languages are visited equally each cycle
     train_langs = sorted(train_iters.keys())
     test_langs = sorted(test_iters.keys())
 
-    # Graceful Ctrl+C
     stop = False
 
     def _on_stop(sig, frame):
@@ -481,18 +412,12 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
     amp_label = f"bf16" if (use_amp and amp_dtype == torch.bfloat16) else "fp32 (AMP off)"
     print(f"\n{'═'*64}")
     print(f"  MTT Training  |  device={device}  |  lr={CFG['lr']:.2e}")
-    print(
-        f"  micro-batch={CFG['batch_size']}  accum={accum_steps}  effective batch={eff_batch}"
-    )
+    print(f"  micro-batch={CFG['batch_size']}  accum={accum_steps}  effective batch={eff_batch}")
     print(f"  Precision : {amp_label}  |  Gradient checkpointing : ON")
-    print(
-        f"  Cycle = {CFG['train_steps']} train steps + {CFG['test_steps']} test steps"
-    )
+    print(f"  Cycle = {CFG['train_steps']} train steps + {CFG['test_steps']} test steps")
     print(f"  Each step = one monolingual batch (one language, always correct)")
     print(f"  Languages : {train_langs}")
-    print(
-        f"  LR: warmup {CFG['warmup_steps']} steps → cosine/cycle → min={CFG['lr_min']:.1e}"
-    )
+    print(f"  LR: warmup {CFG['warmup_steps']} steps → cosine/cycle → min={CFG['lr_min']:.1e}")
     print(f"  NER: spaCy → offset_mapping align → forward() nerTags")
     print(f"  Checkpoint every {CFG['checkpoint_minutes']} min + end of each cycle")
     print(f"  Press Ctrl+C to stop safely at any time")
@@ -514,7 +439,6 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
         train_step = 0
         optimizer.zero_grad(set_to_none=True)
 
-        # Shuffled language schedule — one language per micro-step.
         total_micro = CFG["train_steps"] * accum_steps
         schedule = []
         while len(schedule) < total_micro:
@@ -531,7 +455,6 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
             langs_in_step.append(lang)
             srcs, tgts = next(train_iters[lang])
 
-            # ── NER: spaCy → align offset → nerTags ──────────────────────────
             ner_tags = None
             if nlp is not None:
                 try:
@@ -558,7 +481,6 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
                 )
                 loss = out["loss"] / accum_steps
 
-            # scaler.scale() là no-op khi enabled=False → backward thẳng
             scaler.scale(loss).backward()
             accum_loss += loss.item()
 
@@ -577,31 +499,32 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
                 trans = out["translationLoss"]
                 ner = out["nerLoss"]
                 langs_str = "+".join(langs_in_step)
+
+                # ── FIX 2: log loss không chia accum_steps (đã chia khi backward) ─
                 print(
                     f"  [TRAIN]"
                     f"  global={global_step:>7}"
                     f"  cycle={cycle}  step={train_step:>3}/{CFG['train_steps']}"
                     f"  langs=[{langs_str}]"
                     f"  loss={accum_loss:.4f}"
-                    + (
-                        f"  trans={trans.item()/accum_steps:.4f}"
-                        if trans is not None
-                        else ""
-                    )
-                    + (f"  ner={ner.item()/accum_steps:.4f}" if ner is not None else "")
+                    + (f"  trans={trans.item():.4f}" if trans is not None else "")
+                    + (f"  ner={ner.item():.4f}"   if ner   is not None else "")
                     + f"  lr={optimizer.param_groups[0]['lr']:.2e}"
                 )
+                # ──────────────────────────────────────────────────────────────
+
                 accum_loss = 0.0
                 langs_in_step = []
 
                 if time.time() - last_ckpt >= ckpt_sec:
-                    save_checkpoint(
-                        model, optimizer, scheduler, scaler, global_step, cycle
-                    )
+                    save_checkpoint(model, optimizer, scheduler, scaler, global_step, cycle)
                     last_ckpt = time.time()
 
+                # ── FIX 3: thêm gc.collect() để tránh memory leak dài hạn ───
                 if global_step % 50 == 0 and device == "cuda":
                     torch.cuda.empty_cache()
+                    gc.collect()
+                # ──────────────────────────────────────────────────────────────
 
         avg_train = train_loss_sum / max(train_step, 1)
         print(f"\n  [CYCLE {cycle}]  ── Train done ──  avg loss: {avg_train:.4f}\n")
@@ -670,6 +593,7 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
 
         if device == "cuda":
             torch.cuda.empty_cache()
+            gc.collect()
 
         n = CFG["test_steps"]
         avg_test = test_loss_sum / n
