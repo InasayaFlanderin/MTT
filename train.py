@@ -81,6 +81,8 @@ def _extract_ner_tags(
                     char_tags[c] = tag_id
         char_tag_maps.append(char_tags)
 
+    # NOTE: requires a fast tokenizer (T5TokenizerFast).
+    # return_offsets_mapping raises NotImplementedError on slow tokenizers.
     enc = tokenizer(
         tagged_src,
         padding=True,
@@ -134,13 +136,11 @@ def _pick_amp_dtype(device: str):
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── FIX: train_steps đồng bộ lại với comment (gốc ghi 800 nhưng set 10000) ──
-# Giờ comment và CFG đều nhất quán. Chỉnh train_steps theo nhu cầu thực tế.
 CFG = dict(
     languages              = ["de", "fr", "vi", "es"],
     max_samples_per_pair   = 50_000,
-    train_steps            = 800,      # số optimizer steps mỗi cycle (phase train)
-    test_steps             = 200,      # số steps mỗi cycle (phase eval)
+    train_steps            = 800,
+    test_steps             = 200,
     batch_size             = 8,
     accum_steps            = 16,
     lr                     = 5e-5,
@@ -433,19 +433,26 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
         # ══════════════════════════════════════════════════════════════════════
         model.train()
         train_loss_sum = 0.0
-        accum_loss     = 0.0
         train_step     = 0
         optimizer.zero_grad(set_to_none=True)
 
+        # FIX 5: Build the schedule by cycling through a shuffled language list
+        # repeatedly until we have exactly total_micro entries.  The previous
+        # approach sliced a concatenated list which could under-represent languages
+        # at the tail of the last shuffle block.
         total_micro = CFG["train_steps"] * accum_steps
-        schedule    = []
+        schedule: list[str] = []
         while len(schedule) < total_micro:
             block = train_langs.copy()
             random.shuffle(block)
             schedule.extend(block)
         schedule = schedule[:total_micro]
 
-        langs_in_step = []
+        accum_loss      = 0.0
+        accum_trans     = 0.0
+        accum_ner_count = 0
+        accum_ner_sum   = 0.0
+        langs_in_step   = []
 
         for micro_step, lang in enumerate(schedule, 1):
             if stop:
@@ -460,7 +467,7 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
                         src_texts=srcs,
                         target_lang=lang,
                         nlp=nlp,
-                        tokenizer=model.tokenizer,
+                        tokenizer=model.srcTokenizer,  # NER aligns with source tokens
                         ner_vocab=model.nerVocab,
                         max_length=128,
                         device=device,
@@ -482,6 +489,15 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
             scaler.scale(loss).backward()
             accum_loss += loss.item()
 
+            # FIX 6: Accumulate trans/ner losses across micro-steps so the log
+            # line reports the average over the whole effective batch, not just
+            # the last micro-step.
+            if out["translationLoss"] is not None:
+                accum_trans += out["translationLoss"].item()
+            if out["nerLoss"] is not None:
+                accum_ner_sum   += out["nerLoss"].item()
+                accum_ner_count += 1
+
             if micro_step % accum_steps == 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), CFG["grad_clip"])
@@ -494,8 +510,8 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
                 train_step     += 1
                 train_loss_sum += accum_loss
 
-                trans     = out["translationLoss"]
-                ner       = out["nerLoss"]
+                avg_trans = accum_trans / accum_steps
+                avg_ner   = (accum_ner_sum / accum_ner_count) if accum_ner_count else None
                 langs_str = "+".join(langs_in_step)
 
                 print(
@@ -504,15 +520,18 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
                     f"  cycle={cycle}  step={train_step:>3}/{CFG['train_steps']}"
                     f"  langs=[{langs_str}]"
                     f"  loss={accum_loss:.4f}"
-                    + (f"  trans={trans.item():.4f}" if trans is not None else "")
-                    + (f"  ner={ner.item():.4f}"     if ner   is not None else "")
+                    f"  trans={avg_trans:.4f}"
+                    + (f"  ner={avg_ner:.4f}" if avg_ner is not None else "")
                     + f"  w_trans={out['weight_trans']:.3f}"
                     + f"  w_ner={out['weight_ner']:.3f}"
                     + f"  lr={optimizer.param_groups[0]['lr']:.2e}"
                 )
 
-                accum_loss    = 0.0
-                langs_in_step = []
+                accum_loss      = 0.0
+                accum_trans     = 0.0
+                accum_ner_sum   = 0.0
+                accum_ner_count = 0
+                langs_in_step   = []
 
                 if time.time() - last_ckpt >= ckpt_sec:
                     save_checkpoint(model, optimizer, scheduler, scaler, global_step, cycle)
@@ -554,7 +573,7 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
                             src_texts=srcs,
                             target_lang=lang,
                             nlp=nlp,
-                            tokenizer=model.tokenizer,
+                            tokenizer=model.srcTokenizer,  # NER aligns with source tokens
                             ner_vocab=model.nerVocab,
                             max_length=128,
                             device=device,
