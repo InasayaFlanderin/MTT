@@ -16,7 +16,7 @@ class MTT(nn.Module):
         
         #encoder
         encoderName = "jhu-clsp/mmBERT-small"
-        self.tokenizer = AutoTokenizer.from_pretrained(encoderName)
+        self.tokenizer = AutoTokenizer.from_pretrained(encoderName, use_fast=True)
         self.tokenizer.add_special_tokens({"additional_special_tokens": specialTokens})
         self.encoder = AutoModel.from_pretrained(encoderName)
         self.encoder.resize_token_embeddings(len(self.tokenizer))
@@ -59,26 +59,15 @@ class MTT(nn.Module):
         for param in self.lmHead.parameters():
             param.requires_grad = True
 
+        self.log_var_trans = nn.Parameter(torch.zeros(1))
+        self.log_var_ner = nn.Parameter(torch.zeros(1))
+
     # ══════════════════════════════════════════════════════════════════════════
     # LOAD CHECKPOINT
     # ══════════════════════════════════════════════════════════════════════════
 
     @classmethod
     def load(cls, checkpoint_path: str, device: str = "cpu") -> "MTT":
-        """
-        Tạo model mới rồi load weights từ file checkpoint của train.py.
-
-        Ví dụ:
-            model = MTT.load("mtt_checkpoint.pt", device="cpu")
-            model.eval()
-
-        Args:
-            checkpoint_path : đường dẫn tới file .pt do train.py lưu
-            device          : "cpu" hoặc "cuda"
-
-        Returns:
-            MTT instance đã load weights, ở chế độ eval
-        """
         if not torch.cuda.is_available() and device == "cuda":
             print("[LOAD] CUDA không khả dụng, chuyển sang CPU.")
             device = "cpu"
@@ -89,14 +78,12 @@ class MTT(nn.Module):
         print(f"[LOAD] Đang load checkpoint: {checkpoint_path}")
         ckpt = torch.load(checkpoint_path, map_location=device)
 
-        # Checkpoint từ train.py lưu key "model" chứa state_dict
         if "model" in ckpt:
             state_dict = ckpt["model"]
             print(f"[LOAD] Global step : {ckpt.get('global_step', '?')}")
             print(f"[LOAD] Cycle        : {ckpt.get('cycle', '?')}")
             print(f"[LOAD] LR cuối      : {ckpt.get('lr', '?')}")
         else:
-            # Nếu file là raw state_dict (lưu thẳng không qua train.py)
             state_dict = ckpt
 
         model.load_state_dict(state_dict)
@@ -118,7 +105,6 @@ class MTT(nn.Module):
         print("Total: ", encoderPara + embedPara + nerPara + proPara + decoderPara + lmPara)
 
     def _shiftRight(self, inputIds: torch.Tensor) -> torch.Tensor:
-        """Shift input ids one position right, prepend decoder_start_token_id (teacher forcing)."""
         shifted = inputIds.new_zeros(inputIds.shape)
         shifted[:, 1:] = inputIds[:, :-1].clone()
         shifted[:, 0]  = self.decoderStartTokenId
@@ -201,16 +187,24 @@ class MTT(nn.Module):
 
         totalLoss = None
         if returnLoss and translationLoss is not None:
-            totalLoss = translationLoss
+            precision_trans = torch.exp(-self.log_var_trans)
+            precision_ner   = torch.exp(-self.log_var_ner)
+
+            totalLoss = precision_trans * translationLoss + self.log_var_trans
+            
             if nerLoss is not None:
-                totalLoss = translationLoss + 0.2 * nerLoss
+                totalLoss += precision_ner * nerLoss + self.log_var_ner
+            else:
+                totalLoss += 0.0 * self.log_var_ner 
 
         return {
             "loss": totalLoss,
             "translationLoss": translationLoss,
             "nerLoss": nerLoss,
             "logits": logits,
-            "nerLogits": nerLogits
+            "nerLogits": nerLogits,
+            "weight_trans": torch.exp(-self.log_var_trans).item(),
+            "weight_ner": torch.exp(-self.log_var_ner).item()
         }
 
     def translate(
@@ -319,6 +313,15 @@ class MTT(nn.Module):
 
                         if beamsCounted == numBeams:
                             break
+
+                    # ── FIX: padding nếu tất cả candidates đều là EOS ────────
+                    # Không có padding → tensor size sai → CRASH
+                    while beamsCounted < numBeams:
+                        nextBeamScores.append(-1e9)
+                        nextBeamTokens.append(padTokenId)
+                        nextBeamOrigins.append(b * numBeams)  # fallback beam 0
+                        beamsCounted += 1
+                    # ─────────────────────────────────────────────────────────
 
                     if len(finishedSeqs[b]) >= numBeams:
                         done[b] = True
