@@ -4,8 +4,10 @@ import torch.nn.functional as func
 from transformers import (
     AutoModel,
     MT5ForConditionalGeneration,
-    AutoTokenizer
+    AutoTokenizer,
+    T5Tokenizer,
 )
+
 
 class MTT(nn.Module):
     def __init__(self):
@@ -13,54 +15,67 @@ class MTT(nn.Module):
 
         self.targetLanguages = ["de", "fr", "vi", "en", "es"]
         specialTokens = [f"<2{lang}>" for lang in self.targetLanguages]
-        
-        #encoder
-        encoderName = "jhu-clsp/mmBERT-small"
-        self.tokenizer = AutoTokenizer.from_pretrained(encoderName, use_fast=True)
+
+        # ── FIX 1: Dùng tokenizer của MT5 thay vì mmBERT ──────────────────────
+        # mmBERT dùng WordPiece (~30k tokens), MT5 dùng SentencePiece (~250k tokens).
+        # Toàn bộ trọng số decoder/lm_head của MT5 gắn liền với vocab SentencePiece.
+        # Nếu resize về 30k thì decoder mất knowledge và lm_head predict sai space.
+        # Giải pháp: dùng T5Tokenizer cho cả pipeline, encoder vẫn là mmBERT nhưng
+        # chỉ dùng để trích xuất representation, không dùng vocab của nó để generate.
+        # ─────────────────────────────────────────────────────────────────────────
+        tokenizer_name = "google/mt5-small"
+        self.tokenizer = T5Tokenizer.from_pretrained(tokenizer_name, use_fast=False)
         self.tokenizer.add_special_tokens({"additional_special_tokens": specialTokens})
+
+        # ── Encoder: mmBERT (Modern Multilingual BERT) ────────────────────────
+        encoderName = "jhu-clsp/mmBERT-small"
         self.encoder = AutoModel.from_pretrained(encoderName)
+
+        # Encoder dùng tokenizer MT5 → resize embedding của encoder
         self.encoder.resize_token_embeddings(len(self.tokenizer))
         encoderHiddenSize = self.encoder.config.hidden_size
 
-        #NER
+        # ── NER ───────────────────────────────────────────────────────────────
         self.nerVocab = {
             'O': 0, 'PERSON': 1, 'ORG': 2, 'LOC': 3, 'GPE': 4,
             'DATE': 5, 'MONEY': 6, 'PERCENT': 7, 'TIME': 8, 'QUANTITY': 9
         }
         self.nerEmbed = nn.Embedding(
-            num_embeddings = len(self.nerVocab),
-            embedding_dim = encoderHiddenSize
+            num_embeddings=len(self.nerVocab),
+            embedding_dim=encoderHiddenSize,
         )
         self.nerClassifier = nn.Linear(
             encoderHiddenSize,
-            len(self.nerVocab)
+            len(self.nerVocab),
         )
 
-        #decoder
+        # ── Decoder: MT5 (giữ nguyên vocab/tokenizer của nó) ─────────────────
         mt5 = MT5ForConditionalGeneration.from_pretrained("google/mt5-small")
-        mt5.resize_token_embeddings(len(self.tokenizer))
+        mt5.resize_token_embeddings(len(self.tokenizer))   # chỉ mở rộng cho special tokens
         self.decoder = mt5.decoder
-        self.lmHead = mt5.lm_head
+        self.lmHead  = mt5.lm_head
         self.decoderStartTokenId = mt5.config.decoder_start_token_id or mt5.config.pad_token_id
         del mt5
 
-        #projector
+        # Đảm bảo tokenizer có pad_token_id hợp lệ
+        assert self.tokenizer.pad_token_id is not None, \
+            "Tokenizer thiếu pad_token_id — kiểm tra lại tokenizer_name."
+
+        # ── Projector: ánh xạ encoder dim → decoder dim ───────────────────────
         self.projector = nn.Linear(
             encoderHiddenSize,
-            self.decoder.config.hidden_size
+            self.decoder.config.hidden_size,
         )
 
-        for param in self.encoder.parameters():
-            param.requires_grad = True
-        for param in self.decoder.parameters():
-            param.requires_grad = True
-        for param in self.projector.parameters():
-            param.requires_grad = True
-        for param in self.lmHead.parameters():
-            param.requires_grad = True
+        # Tất cả params đều trainable (giữ nguyên logic gốc)
+        for module in [self.encoder, self.decoder, self.projector, self.lmHead,
+                       self.nerEmbed, self.nerClassifier]:
+            for param in module.parameters():
+                param.requires_grad = True
 
+        # Uncertainty weighting (Kendall et al.)
         self.log_var_trans = nn.Parameter(torch.zeros(1))
-        self.log_var_ner = nn.Parameter(torch.zeros(1))
+        self.log_var_ner   = nn.Parameter(torch.zeros(1))
 
     # ══════════════════════════════════════════════════════════════════════════
     # LOAD CHECKPOINT
@@ -72,7 +87,7 @@ class MTT(nn.Module):
             print("[LOAD] CUDA không khả dụng, chuyển sang CPU.")
             device = "cpu"
 
-        print(f"[LOAD] Đang khởi tạo model...")
+        print("[LOAD] Đang khởi tạo model...")
         model = cls()
 
         print(f"[LOAD] Đang load checkpoint: {checkpoint_path}")
@@ -95,14 +110,21 @@ class MTT(nn.Module):
     # ══════════════════════════════════════════════════════════════════════════
 
     def paramsCalc(self):
-        encoderPara = sum(p.numel() for p in self.encoder.parameters())
-        embedPara = sum(p.numel() for p in self.nerEmbed.parameters())
-        nerPara = sum(p.numel() for p in self.nerClassifier.parameters())
-        proPara = sum(p.numel() for p in self.projector.parameters())
-        decoderPara = sum(p.numel() for p in self.decoder.parameters())
-        lmPara = sum(p.numel() for p in self.lmHead.parameters())
-
-        print("Total: ", encoderPara + embedPara + nerPara + proPara + decoderPara + lmPara)
+        encoderPara  = sum(p.numel() for p in self.encoder.parameters())
+        embedPara    = sum(p.numel() for p in self.nerEmbed.parameters())
+        nerPara      = sum(p.numel() for p in self.nerClassifier.parameters())
+        proPara      = sum(p.numel() for p in self.projector.parameters())
+        decoderPara  = sum(p.numel() for p in self.decoder.parameters())
+        lmPara       = sum(p.numel() for p in self.lmHead.parameters())
+        total        = encoderPara + embedPara + nerPara + proPara + decoderPara + lmPara
+        print(f"  Encoder     : {encoderPara:>12,}")
+        print(f"  NER embed   : {embedPara:>12,}")
+        print(f"  NER linear  : {nerPara:>12,}")
+        print(f"  Projector   : {proPara:>12,}")
+        print(f"  Decoder     : {decoderPara:>12,}")
+        print(f"  LM Head     : {lmPara:>12,}")
+        print(f"  ─────────────────────────")
+        print(f"  Total       : {total:>12,}")
 
     def _shiftRight(self, inputIds: torch.Tensor) -> torch.Tensor:
         shifted = inputIds.new_zeros(inputIds.shape)
@@ -111,37 +133,45 @@ class MTT(nn.Module):
         shifted[shifted == -100] = self.tokenizer.pad_token_id
         return shifted
 
-    def forward(self, srcText, targetLang, targetText=None, nerTags=None, returnLoss=True, device="cpu"):
+    def forward(
+        self,
+        srcText,
+        targetLang,
+        targetText=None,
+        nerTags=None,
+        returnLoss=True,
+        device="cpu",
+    ):
         taggedSrc = [f"<2{targetLang}> {text}" for text in srcText]
         srcEncoded = self.tokenizer(
             taggedSrc,
-            return_tensors = "pt",
-            padding = True,
-            truncation = True,
-            max_length = 128
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=128,
         ).to(device)
+
         labels = None
         decoderInputIds = None
-    
+
         if targetText is not None:
             targetEncoded = self.tokenizer(
                 targetText,
-                return_tensors = "pt",
-                padding = True,
-                truncation = True,
-                max_length = 128
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=128,
             ).to(device)
-            
+
             labels = targetEncoded.input_ids.clone()
             labels[labels == self.tokenizer.pad_token_id] = -100
-
             decoderInputIds = self._shiftRight(labels)
 
         encoderOut = self.encoder(
-            input_ids = srcEncoded.input_ids,
-            attention_mask = srcEncoded.attention_mask
+            input_ids=srcEncoded.input_ids,
+            attention_mask=srcEncoded.attention_mask,
         ).last_hidden_state
-        
+
         nerLogits = self.nerClassifier(encoderOut)
 
         nerLoss = None
@@ -150,13 +180,18 @@ class MTT(nn.Module):
             nerLoss = func.cross_entropy(
                 nerLogits.view(-1, len(self.nerVocab)),
                 nerTags.view(-1),
-                ignore_index = -100
+                ignore_index=-100,
             )
 
+        # ── FIX 2: Mask NER padding positions trước khi cộng vào encoder out ─
+        # Trước đây clamp(-100→0) không mask → noise vào representation.
+        # Giờ position nào tag=-100 (padding) thì nerEmbed nhân 0.
         tagIndices = nerTags if nerTags is not None else nerLogits.argmax(dim=-1)
+        valid_mask = (tagIndices >= 0).unsqueeze(-1).float()   # (B, T, 1)
         tagIndices = tagIndices.clamp(min=0)
-        nerEmbeds = self.nerEmbed(tagIndices)
-        nerOut = encoderOut + nerEmbeds
+        nerEmbeds  = self.nerEmbed(tagIndices) * valid_mask    # zero-out padding positions
+        nerOut     = encoderOut + nerEmbeds
+        # ─────────────────────────────────────────────────────────────────────
 
         projected = self.projector(nerOut)
 
@@ -165,14 +200,14 @@ class MTT(nn.Module):
                 (projected.size(0), 1),
                 self.decoderStartTokenId,
                 dtype=torch.long,
-                device=device
+                device=device,
             )
 
         decoderOut = self.decoder(
-            input_ids              = decoderInputIds,
-            encoder_hidden_states  = projected,
-            encoder_attention_mask = srcEncoded.attention_mask,
-            return_dict            = True
+            input_ids=decoderInputIds,
+            encoder_hidden_states=projected,
+            encoder_attention_mask=srcEncoded.attention_mask,
+            return_dict=True,
         )
 
         logits = self.lmHead(decoderOut.last_hidden_state)
@@ -182,7 +217,7 @@ class MTT(nn.Module):
             translationLoss = func.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1),
-                ignore_index = -100
+                ignore_index=-100,
             )
 
         totalLoss = None
@@ -191,20 +226,21 @@ class MTT(nn.Module):
             precision_ner   = torch.exp(-self.log_var_ner)
 
             totalLoss = precision_trans * translationLoss + self.log_var_trans
-            
+
             if nerLoss is not None:
-                totalLoss += precision_ner * nerLoss + self.log_var_ner
-            else:
-                totalLoss += 0.0 * self.log_var_ner 
+                totalLoss = totalLoss + precision_ner * nerLoss + self.log_var_ner
+            # ── FIX 3: Bỏ `else: 0.0 * log_var_ner` vì nó không tạo gradient ─
+            # log_var_ner sẽ chỉ được update khi có NER data, đây là behaviour đúng.
+            # ─────────────────────────────────────────────────────────────────
 
         return {
-            "loss": totalLoss,
+            "loss":            totalLoss,
             "translationLoss": translationLoss,
-            "nerLoss": nerLoss,
-            "logits": logits,
-            "nerLogits": nerLogits,
-            "weight_trans": torch.exp(-self.log_var_trans).item(),
-            "weight_ner": torch.exp(-self.log_var_ner).item()
+            "nerLoss":         nerLoss,
+            "logits":          logits,
+            "nerLogits":       nerLogits,
+            "weight_trans":    torch.exp(-self.log_var_trans).item(),
+            "weight_ner":      torch.exp(-self.log_var_ner).item(),
         }
 
     def translate(
@@ -213,7 +249,7 @@ class MTT(nn.Module):
         targetLang: str,
         maxNewTokens: int = 128,
         numBeams: int = 4,
-        device: str = "cpu"
+        device: str = "cpu",
     ) -> list[str]:
 
         assert targetLang in self.targetLanguages, \
@@ -227,62 +263,78 @@ class MTT(nn.Module):
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=128
+                max_length=128,
             ).to(device)
 
             encoderOut = self.encoder(
                 input_ids=srcEncoded.input_ids,
-                attention_mask=srcEncoded.attention_mask
+                attention_mask=srcEncoded.attention_mask,
             ).last_hidden_state
 
-            nerLogits = self.nerClassifier(encoderOut)
-            predTags  = nerLogits.argmax(dim=-1)
-            nerEmbeds = self.nerEmbed(predTags)
-            nerOut    = encoderOut + nerEmbeds
+            nerLogits  = self.nerClassifier(encoderOut)
+            predTags   = nerLogits.argmax(dim=-1)
+            valid_mask = (predTags >= 0).unsqueeze(-1).float()
+            nerEmbeds  = self.nerEmbed(predTags.clamp(min=0)) * valid_mask
+            nerOut     = encoderOut + nerEmbeds
+            projected  = self.projector(nerOut)
 
-            projected = self.projector(nerOut)
+            batchSize  = projected.size(0)
+            bosTokenId = self.decoderStartTokenId
+            eosTokenId = self.tokenizer.eos_token_id
+            padTokenId = self.tokenizer.pad_token_id
 
-            batchSize   = projected.size(0)
-            bosTokenId  = self.decoderStartTokenId
-            eosTokenId  = self.tokenizer.eos_token_id
-            padTokenId  = self.tokenizer.pad_token_id
+            # Expand encoder outputs cho beam search
+            expanded = (
+                projected.unsqueeze(1)
+                .expand(-1, numBeams, -1, -1)
+                .reshape(batchSize * numBeams, projected.size(1), projected.size(2))
+            )
+            expandedMask = (
+                srcEncoded.attention_mask.unsqueeze(1)
+                .expand(-1, numBeams, -1)
+                .reshape(batchSize * numBeams, -1)
+            )
 
-            expanded = projected.unsqueeze(1) \
-                            .expand(-1, numBeams, -1, -1) \
-                            .reshape(batchSize * numBeams, projected.size(1), projected.size(2))
-
-            expandedMask = srcEncoded.attention_mask \
-                                 .unsqueeze(1) \
-                                 .expand(-1, numBeams, -1) \
-                                 .reshape(batchSize * numBeams, -1)
-
-            beamScores  = torch.zeros(batchSize, numBeams, device=device)
+            beamScores = torch.zeros(batchSize, numBeams, device=device)
             beamScores[:, 1:] = -1e9
-            beamScores  = beamScores.view(-1)
+            beamScores = beamScores.view(-1)
 
             inputIds = torch.full(
                 (batchSize * numBeams, 1),
                 bosTokenId,
                 dtype=torch.long,
-                device=device
+                device=device,
             )
+
+            # ── FIX 4: KV cache để tránh recompute attention mỗi bước ─────────
+            # Trước đây mỗi step decode lại full sequence → chậm O(n²).
+            # Giờ dùng past_key_values → chỉ compute token mới → nhanh hơn nhiều.
+            past_key_values = None
+            # ─────────────────────────────────────────────────────────────────
 
             done         = [False] * batchSize
             finishedSeqs = [[] for _ in range(batchSize)]
 
-            for _ in range(maxNewTokens):
+            for step_i in range(maxNewTokens):
+                # Chỉ feed token cuối nếu có cache, feed toàn bộ ở step đầu
+                cur_input = inputIds if step_i == 0 else inputIds[:, -1:]
+
                 decoderOut = self.decoder(
-                    input_ids=inputIds,
+                    input_ids=cur_input,
                     encoder_hidden_states=expanded,
                     encoder_attention_mask=expandedMask,
-                    return_dict=True
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
                 )
-                logits      = self.lmHead(decoderOut.last_hidden_state[:, -1, :])
-                logProbs    = torch.log_softmax(logits, dim=-1)
+                past_key_values = decoderOut.past_key_values
 
-                vocabSize   = logProbs.size(-1)
-                nextScores  = beamScores.unsqueeze(-1) + logProbs
-                nextScores  = nextScores.view(batchSize, numBeams * vocabSize)
+                logits   = self.lmHead(decoderOut.last_hidden_state[:, -1, :])
+                logProbs = torch.log_softmax(logits, dim=-1)
+
+                vocabSize  = logProbs.size(-1)
+                nextScores = beamScores.unsqueeze(-1) + logProbs
+                nextScores = nextScores.view(batchSize, numBeams * vocabSize)
 
                 topScores, topIndices = torch.topk(nextScores, 2 * numBeams, dim=-1)
 
@@ -294,17 +346,23 @@ class MTT(nn.Module):
                     if done[b]:
                         nextBeamScores.extend([0.0] * numBeams)
                         nextBeamTokens.extend([padTokenId] * numBeams)
-                        nextBeamOrigins.extend(list(range(b * numBeams, (b + 1) * numBeams)))
+                        nextBeamOrigins.extend(
+                            list(range(b * numBeams, (b + 1) * numBeams))
+                        )
                         continue
 
                     beamsCounted = 0
-                    for score, idx in zip(topScores[b].tolist(), topIndices[b].tolist()):
+                    for score, idx in zip(
+                        topScores[b].tolist(), topIndices[b].tolist()
+                    ):
                         beamIdx    = idx // vocabSize
-                        tokenIdx   = idx  % vocabSize
+                        tokenIdx   = idx % vocabSize
                         globalBeam = b * numBeams + beamIdx
 
                         if tokenIdx == eosTokenId:
-                            finishedSeqs[b].append((score, inputIds[globalBeam].tolist()))
+                            finishedSeqs[b].append(
+                                (score, inputIds[globalBeam].tolist())
+                            )
                         else:
                             nextBeamScores.append(score)
                             nextBeamTokens.append(tokenIdx)
@@ -314,14 +372,12 @@ class MTT(nn.Module):
                         if beamsCounted == numBeams:
                             break
 
-                    # ── FIX: padding nếu tất cả candidates đều là EOS ────────
-                    # Không có padding → tensor size sai → CRASH
+                    # Padding nếu tất cả candidates đều là EOS
                     while beamsCounted < numBeams:
                         nextBeamScores.append(-1e9)
                         nextBeamTokens.append(padTokenId)
-                        nextBeamOrigins.append(b * numBeams)  # fallback beam 0
+                        nextBeamOrigins.append(b * numBeams)
                         beamsCounted += 1
-                    # ─────────────────────────────────────────────────────────
 
                     if len(finishedSeqs[b]) >= numBeams:
                         done[b] = True
@@ -330,8 +386,22 @@ class MTT(nn.Module):
                     break
 
                 beamScores = torch.tensor(nextBeamScores, device=device)
-                nextTokens = torch.tensor(nextBeamTokens, dtype=torch.long, device=device).unsqueeze(-1)
-                inputIds   = torch.cat([inputIds[nextBeamOrigins], nextTokens], dim=-1)
+                nextTokens = torch.tensor(
+                    nextBeamTokens, dtype=torch.long, device=device
+                ).unsqueeze(-1)
+                inputIds   = torch.cat(
+                    [inputIds[nextBeamOrigins], nextTokens], dim=-1
+                )
+
+                # Reorder KV cache theo beam origins
+                if past_key_values is not None:
+                    origins_tensor = torch.tensor(
+                        nextBeamOrigins, dtype=torch.long, device=device
+                    )
+                    past_key_values = tuple(
+                        tuple(layer_cache[origins_tensor] for layer_cache in layer)
+                        for layer in past_key_values
+                    )
 
             translations = []
             for b in range(batchSize):
