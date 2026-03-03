@@ -138,8 +138,8 @@ CFG = dict(
     max_samples_per_pair=50_000,
     train_steps=10000,
     test_steps=200,
-    batch_size=16,
-    accum_steps=8,
+    batch_size=8,
+    accum_steps=16,
     lr=5e-5,
     grad_clip=1.0,
     warmup_steps=400,
@@ -382,7 +382,7 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
 
     # ── FIX 1: GradScaler không nhận positional arg 'device' (PyTorch >= 2.3) ─
-    scaler = GradScaler(enabled=False)
+    scaler = GradScaler(enabled=use_amp)
     # ──────────────────────────────────────────────────────────────────────────
 
     global_step, cycle = load_checkpoint(model, optimizer, scheduler, scaler, device)
@@ -470,7 +470,7 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
                 except Exception as e:
                     print(f"  [NER ]  WARNING: {e} — skipping nerTags this step")
 
-            with autocast(device, dtype=amp_dtype, enabled=use_amp):
+            with autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
                 out = model(
                     srcText=srcs,
                     targetLang=lang,
@@ -566,7 +566,7 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
                     except Exception:
                         pass
 
-                with autocast(device, dtype=amp_dtype, enabled=use_amp):
+                with autocast(device_type=device, dtype=amp_dtype, enabled=use_amp):
                     out = model(
                         srcText=srcs,
                         targetLang=lang,
