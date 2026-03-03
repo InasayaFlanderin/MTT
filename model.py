@@ -3,9 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as func
 from transformers import (
     AutoModel,
-    MT5ForConditionalGeneration,
     AutoTokenizer,
-    T5Tokenizer,
+    MT5ForConditionalGeneration,
+    T5TokenizerFast,
 )
 
 
@@ -16,23 +16,36 @@ class MTT(nn.Module):
         self.targetLanguages = ["de", "fr", "vi", "en", "es"]
         specialTokens = [f"<2{lang}>" for lang in self.targetLanguages]
 
-        # ── FIX 1: Dùng tokenizer của MT5 thay vì mmBERT ──────────────────────
-        # mmBERT dùng WordPiece (~30k tokens), MT5 dùng SentencePiece (~250k tokens).
-        # Toàn bộ trọng số decoder/lm_head của MT5 gắn liền với vocab SentencePiece.
-        # Nếu resize về 30k thì decoder mất knowledge và lm_head predict sai space.
-        # Giải pháp: dùng T5Tokenizer cho cả pipeline, encoder vẫn là mmBERT nhưng
-        # chỉ dùng để trích xuất representation, không dùng vocab của nó để generate.
-        # ─────────────────────────────────────────────────────────────────────────
-        tokenizer_name = "google/mt5-small"
-        self.tokenizer = T5Tokenizer.from_pretrained(tokenizer_name, use_fast=False)
-        self.tokenizer.add_special_tokens({"additional_special_tokens": specialTokens})
+        # ── Source tokenizer: mmBERT's own Gemma 2-based tokenizer (~256k vocab) ──
+        # mmBERT is built on ModernBERT and uses a Gemma 2 tokenizer, NOT WordPiece.
+        # Its embedding table (98M of the 140M total params) was trained with this
+        # vocabulary. Using any other tokenizer and then resizing would silently
+        # remap the trained embedding weights to wrong token IDs, destroying the
+        # encoder's pretrained knowledge.
+        # The source (encoder) and target (decoder) tokenizers do NOT need to share
+        # a vocabulary — they are connected only through cross-attention on projected
+        # hidden states. We keep each tokenizer native to its model.
+        # AutoTokenizer for mmBERT loads GemmaTokenizerFast, which is a Rust-backed
+        # fast tokenizer and supports return_offsets_mapping=True (required by NER).
+        self.srcTokenizer = AutoTokenizer.from_pretrained("jhu-clsp/mmBERT-small")
+        self.srcTokenizer.add_special_tokens({"additional_special_tokens": specialTokens})
+
+        # ── Target tokenizer: MT5's SentencePiece tokenizer (~250k vocab) ────────
+        # Used to encode target sequences for training and decode output token ids.
+        # FIX (CRITICAL): Must be the Fast variant — the slow T5Tokenizer raises
+        # NotImplementedError on return_offsets_mapping=True, causing NER to silently
+        # never train (the exception was swallowed by try/except in train.py).
+        self.tokenizer = T5TokenizerFast.from_pretrained("google/mt5-small")
+        # Note: special lang tokens are only needed on the source side; the decoder
+        # never sees them as input tokens. No resize needed for the target tokenizer.
 
         # ── Encoder: mmBERT (Modern Multilingual BERT) ────────────────────────
         encoderName = "jhu-clsp/mmBERT-small"
         self.encoder = AutoModel.from_pretrained(encoderName)
 
-        # Encoder dùng tokenizer MT5 → resize embedding của encoder
-        self.encoder.resize_token_embeddings(len(self.tokenizer))
+        # Only resize for the newly added special language tokens — preserves all
+        # existing Gemma 2 embedding weights, appending new rows for <2de> etc.
+        self.encoder.resize_token_embeddings(len(self.srcTokenizer))
         encoderHiddenSize = self.encoder.config.hidden_size
 
         # ── NER ───────────────────────────────────────────────────────────────
@@ -49,12 +62,24 @@ class MTT(nn.Module):
             len(self.nerVocab),
         )
 
-        # ── Decoder: MT5 (giữ nguyên vocab/tokenizer của nó) ─────────────────
+        # ── Decoder: MT5 (native vocab, no resizing needed) ──────────────────
         mt5 = MT5ForConditionalGeneration.from_pretrained("google/mt5-small")
-        mt5.resize_token_embeddings(len(self.tokenizer))   # chỉ mở rộng cho special tokens
+        # No resize — MT5's lm_head and decoder embeddings stay aligned with
+        # its own SentencePiece vocab, which self.tokenizer already matches.
+
+        # FIX 2: Use `is not None` instead of truthiness check.
+        # mt5.config.decoder_start_token_id == 0 for MT5, and `0 or x` evaluates
+        # to x in Python (0 is falsy), so the original code always fell through
+        # to pad_token_id.  Both happen to be 0 for MT5-small so no runtime
+        # difference, but the logic was wrong and would break on other models.
+        self.decoderStartTokenId = (
+            mt5.config.decoder_start_token_id
+            if mt5.config.decoder_start_token_id is not None
+            else mt5.config.pad_token_id
+        )
+
         self.decoder = mt5.decoder
         self.lmHead  = mt5.lm_head
-        self.decoderStartTokenId = mt5.config.decoder_start_token_id or mt5.config.pad_token_id
         del mt5
 
         # Đảm bảo tokenizer có pad_token_id hợp lệ
@@ -67,7 +92,7 @@ class MTT(nn.Module):
             self.decoder.config.hidden_size,
         )
 
-        # Tất cả params đều trainable (giữ nguyên logic gốc)
+        # Tất cả params đều trainable
         for module in [self.encoder, self.decoder, self.projector, self.lmHead,
                        self.nerEmbed, self.nerClassifier]:
             for param in module.parameters():
@@ -143,7 +168,7 @@ class MTT(nn.Module):
         device="cpu",
     ):
         taggedSrc = [f"<2{targetLang}> {text}" for text in srcText]
-        srcEncoded = self.tokenizer(
+        srcEncoded = self.srcTokenizer(          # source uses mmBERT's tokenizer
             taggedSrc,
             return_tensors="pt",
             padding=True,
@@ -155,7 +180,7 @@ class MTT(nn.Module):
         decoderInputIds = None
 
         if targetText is not None:
-            targetEncoded = self.tokenizer(
+            targetEncoded = self.tokenizer(      # target uses MT5's tokenizer
                 targetText,
                 return_tensors="pt",
                 padding=True,
@@ -183,15 +208,11 @@ class MTT(nn.Module):
                 ignore_index=-100,
             )
 
-        # ── FIX 2: Mask NER padding positions trước khi cộng vào encoder out ─
-        # Trước đây clamp(-100→0) không mask → noise vào representation.
-        # Giờ position nào tag=-100 (padding) thì nerEmbed nhân 0.
         tagIndices = nerTags if nerTags is not None else nerLogits.argmax(dim=-1)
-        valid_mask = (tagIndices >= 0).unsqueeze(-1).float()   # (B, T, 1)
+        valid_mask = (tagIndices >= 0).unsqueeze(-1).float()
         tagIndices = tagIndices.clamp(min=0)
-        nerEmbeds  = self.nerEmbed(tagIndices) * valid_mask    # zero-out padding positions
+        nerEmbeds  = self.nerEmbed(tagIndices) * valid_mask
         nerOut     = encoderOut + nerEmbeds
-        # ─────────────────────────────────────────────────────────────────────
 
         projected = self.projector(nerOut)
 
@@ -229,9 +250,6 @@ class MTT(nn.Module):
 
             if nerLoss is not None:
                 totalLoss = totalLoss + precision_ner * nerLoss + self.log_var_ner
-            # ── FIX 3: Bỏ `else: 0.0 * log_var_ner` vì nó không tạo gradient ─
-            # log_var_ner sẽ chỉ được update khi có NER data, đây là behaviour đúng.
-            # ─────────────────────────────────────────────────────────────────
 
         return {
             "loss":            totalLoss,
@@ -258,7 +276,7 @@ class MTT(nn.Module):
         self.eval()
         with torch.no_grad():
             taggedSrc = [f"<2{targetLang}> {text}" for text in srcText]
-            srcEncoded = self.tokenizer(
+            srcEncoded = self.srcTokenizer(      # source uses mmBERT's tokenizer
                 taggedSrc,
                 return_tensors="pt",
                 padding=True,
@@ -271,19 +289,20 @@ class MTT(nn.Module):
                 attention_mask=srcEncoded.attention_mask,
             ).last_hidden_state
 
-            nerLogits  = self.nerClassifier(encoderOut)
-            predTags   = nerLogits.argmax(dim=-1)
-            valid_mask = (predTags >= 0).unsqueeze(-1).float()
-            nerEmbeds  = self.nerEmbed(predTags.clamp(min=0)) * valid_mask
-            nerOut     = encoderOut + nerEmbeds
-            projected  = self.projector(nerOut)
+            # FIX 3: Removed dead valid_mask — argmax always returns >= 0 so
+            # the mask was always all-ones and zeroed nothing.  The mask is only
+            # meaningful in forward() where nerTags can contain -100 (padding).
+            nerLogits = self.nerClassifier(encoderOut)
+            predTags  = nerLogits.argmax(dim=-1)          # always >= 0
+            nerEmbeds = self.nerEmbed(predTags)            # no masking needed
+            nerOut    = encoderOut + nerEmbeds
+            projected = self.projector(nerOut)
 
             batchSize  = projected.size(0)
             bosTokenId = self.decoderStartTokenId
             eosTokenId = self.tokenizer.eos_token_id
             padTokenId = self.tokenizer.pad_token_id
 
-            # Expand encoder outputs cho beam search
             expanded = (
                 projected.unsqueeze(1)
                 .expand(-1, numBeams, -1, -1)
@@ -306,17 +325,11 @@ class MTT(nn.Module):
                 device=device,
             )
 
-            # ── FIX 4: KV cache để tránh recompute attention mỗi bước ─────────
-            # Trước đây mỗi step decode lại full sequence → chậm O(n²).
-            # Giờ dùng past_key_values → chỉ compute token mới → nhanh hơn nhiều.
             past_key_values = None
-            # ─────────────────────────────────────────────────────────────────
-
             done         = [False] * batchSize
             finishedSeqs = [[] for _ in range(batchSize)]
 
             for step_i in range(maxNewTokens):
-                # Chỉ feed token cuối nếu có cache, feed toàn bộ ở step đầu
                 cur_input = inputIds if step_i == 0 else inputIds[:, -1:]
 
                 decoderOut = self.decoder(
@@ -372,7 +385,6 @@ class MTT(nn.Module):
                         if beamsCounted == numBeams:
                             break
 
-                    # Padding nếu tất cả candidates đều là EOS
                     while beamsCounted < numBeams:
                         nextBeamScores.append(-1e9)
                         nextBeamTokens.append(padTokenId)
@@ -389,15 +401,18 @@ class MTT(nn.Module):
                 nextTokens = torch.tensor(
                     nextBeamTokens, dtype=torch.long, device=device
                 ).unsqueeze(-1)
-                inputIds   = torch.cat(
-                    [inputIds[nextBeamOrigins], nextTokens], dim=-1
+
+                # FIX 4: Convert origins to a tensor once and reuse for both
+                # inputIds reorder and past_key_values reorder — avoids implicit
+                # list-to-tensor conversion happening twice with different semantics.
+                origins_tensor = torch.tensor(
+                    nextBeamOrigins, dtype=torch.long, device=device
+                )
+                inputIds = torch.cat(
+                    [inputIds[origins_tensor], nextTokens], dim=-1
                 )
 
-                # Reorder KV cache theo beam origins
                 if past_key_values is not None:
-                    origins_tensor = torch.tensor(
-                        nextBeamOrigins, dtype=torch.long, device=device
-                    )
                     past_key_values = tuple(
                         tuple(layer_cache[origins_tensor] for layer_cache in layer)
                         for layer in past_key_values
